@@ -1,0 +1,115 @@
+"""Central configuration. Reads .env + environment variables.
+
+All tunables live here. Import `settings` anywhere in the codebase.
+"""
+from __future__ import annotations
+
+from datetime import time
+from pathlib import Path
+from typing import List, Literal
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _parse_time(s: str) -> time:
+    hh, mm = s.split(":")
+    return time(int(hh), int(mm))
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # runtime
+    MODE: Literal["paper", "live", "backtest"] = "paper"
+
+    # symbols
+    SYMBOLS: str = "XAUUSD,EURUSD,GBPUSD,USDJPY,GBPJPY,AUDUSD"
+    PRIMARY_SYMBOL: str = "XAUUSD"
+
+    # timeframes
+    BIAS_TIMEFRAME: str = "M15"
+    EXECUTION_TIMEFRAME: str = "M1"
+
+    # risk
+    RISK_PER_TRADE: float = 0.02
+    MAX_DAILY_LOSS: float = 0.06
+    MAX_WEEKLY_LOSS: float = 0.10
+    MAX_TRADES_PER_DAY: int = 1
+    MAX_CONCURRENT_TRADES: int = 1
+    MIN_RR: float = 1.0
+    CONSEC_LOSS_COOLDOWN_HOURS: int = 0
+    MAX_SPREAD_POINTS_XAUUSD: int = 40
+    MAX_SPREAD_POINTS_FOREX: int = 20
+    RR_TARGET: float = 1.2
+    STARTING_EQUITY: float = 1000.0
+
+    # sessions
+    LONDON_OPEN: str = "07:00"
+    LONDON_CLOSE: str = "10:00"
+    NY_OPEN: str = "12:30"
+    NY_CLOSE: str = "16:00"
+    BLOCK_ASIAN_SESSION: bool = True
+
+    # MT5
+    MT5_LOGIN: int | None = None
+    MT5_PASSWORD: str | None = None
+    MT5_SERVER: str | None = None
+    MT5_PATH: str | None = None
+    MT5_MAGIC: int = 20251116
+
+    # DB
+    DATABASE_URL: str = "sqlite:///./smc.db"
+
+    # ML
+    ML_ENABLED: bool = True
+    ML_MIN_TRADES: int = 100
+    ML_PROB_THRESHOLD: float = 0.55
+    ML_MODEL_PATH: str = "./models/latest.pkl"
+
+    # Telegram
+    TELEGRAM_BOT_TOKEN: str | None = None
+    TELEGRAM_CHAT_ID: str | None = None
+
+    # API
+    API_HOST: str = "0.0.0.0"
+    API_PORT: int = 8080
+    API_TOKEN: str = "change-me"
+
+    # logging
+    LOG_LEVEL: str = "INFO"
+    LOG_DIR: str = "./logs"
+
+    # ---- helpers ----
+    @property
+    def symbols_list(self) -> List[str]:
+        return [s.strip().upper() for s in self.SYMBOLS.split(",") if s.strip()]
+
+    @property
+    def london_open_t(self) -> time: return _parse_time(self.LONDON_OPEN)
+    @property
+    def london_close_t(self) -> time: return _parse_time(self.LONDON_CLOSE)
+    @property
+    def ny_open_t(self) -> time: return _parse_time(self.NY_OPEN)
+    @property
+    def ny_close_t(self) -> time: return _parse_time(self.NY_CLOSE)
+
+    @field_validator("RISK_PER_TRADE", "MAX_DAILY_LOSS", "MAX_WEEKLY_LOSS")
+    @classmethod
+    def _nonneg_small(cls, v: float) -> float:
+        if v < 0 or v > 0.5:
+            raise ValueError("risk fractions must be in [0, 0.5]")
+        return v
+
+    def ensure_dirs(self) -> None:
+        Path(self.LOG_DIR).mkdir(parents=True, exist_ok=True)
+        Path(self.ML_MODEL_PATH).parent.mkdir(parents=True, exist_ok=True)
+
+
+settings = Settings()
+settings.ensure_dirs()

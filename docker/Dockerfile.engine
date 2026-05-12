@@ -1,0 +1,34 @@
+# Linux image for paper/backtest workloads and the API.
+# NOTE: MT5 (live broker) is Windows-only. For live trading use the Windows
+# VPS setup described in docker/Dockerfile.windows.md.
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# system deps for lightgbm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential libgomp1 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+COPY . .
+
+RUN mkdir -p logs models reports data
+
+# non-root user
+RUN useradd -m -u 1000 bot && chown -R bot:bot /app
+USER bot
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl -fsS http://localhost:8080/health || exit 1
+
+# Default entrypoint: paper trading. Override to run backtest or live.
+CMD ["python", "scripts/run_paper.py"]

@@ -1,0 +1,47 @@
+# Reference config — most settings come from .env.
+# This file documents per-symbol overrides the engine applies.
+# Wire-up: read via yaml.safe_load(open('config/default.yaml')) and merge into
+# strategy parameters. (Not consumed by default; present for future extension.)
+
+symbols:
+  XAUUSD:
+    risk_per_trade: 0.005
+    max_spread_points: 40
+    min_atr_points: 30        # avoid dead volatility
+    prefer_sessions: [LONDON, OVERLAP, NY]
+    displacement_mult: 1.5
+    fvg_min_atr_ratio: 0.2
+    min_rr: 2.0
+
+  EURUSD:
+    risk_per_trade: 0.005
+    max_spread_points: 15
+    min_atr_points: 5
+    prefer_sessions: [LONDON, OVERLAP, NY]
+    displacement_mult: 1.5
+    fvg_min_atr_ratio: 0.2
+    min_rr: 2.0
+
+  GBPUSD:
+    risk_per_trade: 0.005
+    max_spread_points: 20
+    min_atr_points: 6
+    prefer_sessions: [LONDON, OVERLAP, NY]
+
+  USDJPY:
+    risk_per_trade: 0.005
+    max_spread_points: 15
+    min_atr_points: 5
+    prefer_sessions: [NY, OVERLAP]
+
+  GBPJPY:
+    risk_per_trade: 0.004      # volatile — slightly less size
+    max_spread_points: 30
+    min_atr_points: 10
+    prefer_sessions: [LONDON, OVERLAP]
+
+  AUDUSD:
+    risk_per_trade: 0.005
+    max_spread_points: 18
+    min_atr_points: 4
+    prefer_sessions: [ASIA, LONDON]   # AUD is most active in Asia/London
