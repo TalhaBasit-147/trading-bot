@@ -153,28 +153,114 @@ class MT5Broker(Broker):
 
     # ---- orders ----
 
+    # def place_market(self, symbol: str, side: Side, lots: float, sl: float, tp: float, comment: str = "") -> Optional[Position]:
+    #     info = self.symbol_info(symbol)
+    #     tick_ = mt5.symbol_info_tick(symbol)  # type: ignore
+    #     order_type = mt5.ORDER_TYPE_BUY if side == Side.BUY else mt5.ORDER_TYPE_SELL  # type: ignore
+    #     price = tick_.ask if side == Side.BUY else tick_.bid
+    #     request = {
+    #         "action": mt5.TRADE_ACTION_DEAL,  # type: ignore
+    #         "symbol": symbol,
+    #         "volume": float(lots),
+    #         "type": order_type,
+    #         "price": float(price),
+    #         "sl": float(sl),
+    #         "tp": float(tp),
+    #         "deviation": 20,
+    #         "magic": self._magic,
+    #         "comment": comment[:30],
+    #         "type_time": mt5.ORDER_TIME_GTC,  # type: ignore
+    #         "type_filling": mt5.ORDER_FILLING_IOC,  # type: ignore
+    #     }
+    #     result = mt5.order_send(request)  # type: ignore
+    #     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:  # type: ignore
+    #         logger.error(f"order_send failed: {getattr(result, 'retcode', None)} {getattr(result, 'comment', '')}")
+    #         return None
+    #     logger.info(f"[MT5] OPEN #{result.order} {side.value} {lots} {symbol} @ {result.price} sl={sl} tp={tp}")
+    #     return Position(
+    #         symbol=symbol, side=side, qty=lots, entry=result.price,
+    #         sl=sl, tp=tp, open_ts=datetime.now(timezone.utc),
+    #         ticket=result.order, comment=comment,
+    #     )
+
     def place_market(self, symbol: str, side: Side, lots: float, sl: float, tp: float, comment: str = "") -> Optional[Position]:
-        info = self.symbol_info(symbol)
+        info_raw = mt5.symbol_info(symbol)  # type: ignore
+        if info_raw is None:
+            mt5.symbol_select(symbol, True)  # type: ignore
+            info_raw = mt5.symbol_info(symbol)  # type: ignore
         tick_ = mt5.symbol_info_tick(symbol)  # type: ignore
+        point = info_raw.point
+        digits = info_raw.digits
+
         order_type = mt5.ORDER_TYPE_BUY if side == Side.BUY else mt5.ORDER_TYPE_SELL  # type: ignore
         price = tick_.ask if side == Side.BUY else tick_.bid
+
+        # --- Minimum stop distance fix ---
+        # Broker requires SL/TP to be at least `trade_stops_level` points away
+        # from the current price. If our stops are too close (because price moved
+        # past our intended entry), push them out to the minimum allowed distance.
+        stops_level = getattr(info_raw, "trade_stops_level", 0) or 0
+        freeze_level = getattr(info_raw, "trade_freeze_level", 0) or 0
+        min_dist = max(stops_level, freeze_level) * point
+        # add a small safety buffer (5 points) on top of the broker minimum
+        min_dist += 5 * point
+
+        sl = float(sl)
+        tp = float(tp)
+
+        if side == Side.BUY:
+            # SL must be below price by at least min_dist; TP above by at least min_dist
+            max_sl = price - min_dist
+            if sl > max_sl:
+                logger.warning(f"[MT5] BUY SL {sl:.{digits}f} too close to price {price:.{digits}f}, "
+                               f"adjusting to {max_sl:.{digits}f} (min_dist={min_dist})")
+                sl = max_sl
+            min_tp = price + min_dist
+            if tp < min_tp:
+                tp = min_tp
+        else:
+            # SELL: SL must be above price by at least min_dist; TP below
+            min_sl = price + min_dist
+            if sl < min_sl:
+                logger.warning(f"[MT5] SELL SL {sl:.{digits}f} too close to price {price:.{digits}f}, "
+                               f"adjusting to {min_sl:.{digits}f} (min_dist={min_dist})")
+                sl = min_sl
+            max_tp = price - min_dist
+            if tp > max_tp:
+                tp = max_tp
+
+        # Round to digits
+        sl = round(sl, digits)
+        tp = round(tp, digits)
+        price = round(float(price), digits)
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,  # type: ignore
             "symbol": symbol,
             "volume": float(lots),
             "type": order_type,
-            "price": float(price),
-            "sl": float(sl),
-            "tp": float(tp),
-            "deviation": 20,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "deviation": 30,
             "magic": self._magic,
             "comment": comment[:30],
             "type_time": mt5.ORDER_TIME_GTC,  # type: ignore
             "type_filling": mt5.ORDER_FILLING_IOC,  # type: ignore
         }
         result = mt5.order_send(request)  # type: ignore
+
+        # If filling mode rejected, retry with FOK then RETURN
+        if result is not None and result.retcode == 10030:  # unsupported filling mode
+            for fill_mode in (mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN):  # type: ignore
+                request["type_filling"] = fill_mode
+                result = mt5.order_send(request)  # type: ignore
+                if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:  # type: ignore
+                    break
+
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:  # type: ignore
-            logger.error(f"order_send failed: {getattr(result, 'retcode', None)} {getattr(result, 'comment', '')}")
+            logger.error(f"order_send failed: {getattr(result, 'retcode', None)} {getattr(result, 'comment', '')} "
+                         f"(price={price} sl={sl} tp={tp} min_dist={min_dist})")
             return None
         logger.info(f"[MT5] OPEN #{result.order} {side.value} {lots} {symbol} @ {result.price} sl={sl} tp={tp}")
         return Position(
@@ -182,6 +268,32 @@ class MT5Broker(Broker):
             sl=sl, tp=tp, open_ts=datetime.now(timezone.utc),
             ticket=result.order, comment=comment,
         )
+
+    def modify_sl_tp(self, ticket: int, sl: float, tp: float) -> bool:
+        """Modify SL/TP of an open position. Returns True on success.
+        Used to re-anchor TP to the actual fill price after slippage."""
+        positions = mt5.positions_get(ticket=ticket)  # type: ignore
+        if not positions:
+            logger.warning(f"[MT5] modify_sl_tp: position #{ticket} not found")
+            return False
+        p = positions[0]
+        info_raw = mt5.symbol_info(p.symbol)  # type: ignore
+        digits = info_raw.digits if info_raw else 2
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,  # type: ignore
+            "symbol": p.symbol,
+            "position": int(ticket),
+            "sl": round(float(sl), digits),
+            "tp": round(float(tp), digits),
+            "magic": self._magic,
+        }
+        result = mt5.order_send(request)  # type: ignore
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:  # type: ignore
+            logger.warning(f"[MT5] modify_sl_tp failed for #{ticket}: "
+                           f"{getattr(result, 'retcode', None)} {getattr(result, 'comment', '')}")
+            return False
+        logger.info(f"[MT5] MODIFY #{ticket} sl={request['sl']} tp={request['tp']}")
+        return True
 
     def close(self, ticket: int) -> float:
         positions = mt5.positions_get(ticket=ticket)  # type: ignore

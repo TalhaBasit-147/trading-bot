@@ -39,7 +39,6 @@ from app.strategy.fvg_retest import FVGRetestStrategy
 from app.strategy.prev_week_breakout import PrevWeekBreakoutStrategy
 from app.strategy.orb_5min import ORB5MinStrategy
 from app.strategy.risk import RiskManager
-from app.strategy.ftmo_guard import FTMOGuard, FTMOConfig
 
 
 KILL_FILE = "./KILL"
@@ -104,25 +103,6 @@ class Engine:
         engine_state.risk    = self.risk
         engine_state.running = True
 
-        # ── FTMO prop-challenge guard (active only when FTMO_MODE is set) ──
-        # When enabled via .env, enforces equity-based daily loss, static
-        # overall drawdown, profit-target stop, and min-trading-days — all
-        # with conservative buffers BELOW the FTMO hard limits. Disabled by
-        # default so the normal demo/live behaviour is byte-for-byte unchanged.
-        self.ftmo = None
-        if getattr(settings, "FTMO_MODE", False):
-            init_bal = self.broker.account_balance() or self.broker.account_equity() \
-                       or settings.STARTING_EQUITY
-            self.ftmo = FTMOGuard(FTMOConfig(
-                initial_balance=float(init_bal),
-                daily_loss_pct=getattr(settings, "FTMO_DAILY_LOSS_PCT", 0.05),
-                max_loss_pct=getattr(settings, "FTMO_MAX_LOSS_PCT", 0.10),
-                profit_target_pct=getattr(settings, "FTMO_PROFIT_TARGET_PCT", 0.05),
-                min_trading_days=getattr(settings, "FTMO_MIN_TRADING_DAYS", 2),
-                daily_buffer_pct=getattr(settings, "FTMO_DAILY_BUFFER_PCT", 0.04),
-                max_buffer_pct=getattr(settings, "FTMO_MAX_BUFFER_PCT", 0.08),
-            ))
-
     @property
     def _all_strategies(self):
         return self.live_strategies + self.paper_strategies
@@ -139,14 +119,6 @@ class Engine:
         logger.info(f"Engine starting. Mode={settings.MODE}")
         logger.info(f"Live strategies: {live_names}")
         logger.info(f"Paper strategies: {paper_names}")
-        if self.ftmo is not None:
-            logger.info(f"FTMO GUARD ARMED — initial=${self.ftmo.cfg.initial_balance:,.0f} "
-                        f"daily_stop={self.ftmo.cfg.daily_buffer_pct*100:.0f}% "
-                        f"overall_stop={self.ftmo.cfg.max_buffer_pct*100:.0f}% "
-                        f"target={self.ftmo.cfg.profit_target_pct*100:.0f}%")
-            self.notifier.send(f"🛡️ FTMO guard armed: ${self.ftmo.cfg.initial_balance:,.0f} "
-                               f"account, stop at {self.ftmo.cfg.daily_buffer_pct*100:.0f}% daily / "
-                               f"{self.ftmo.cfg.max_buffer_pct*100:.0f}% overall")
         self._ensure_symbol()
 
         while not self._stop.is_set():
@@ -219,25 +191,6 @@ class Engine:
             self.risk.on_new_day(eq)
             logger.info(f"New day: {day}, equity=${eq:,.2f}")
 
-        # ── FTMO guard: update on every tick with live equity/balance ──
-        if self.ftmo is not None:
-            try:
-                _eq = self.broker.account_equity()
-                _bal = self.broker.account_balance()
-            except Exception as e:
-                logger.warning(f"[FTMO] equity/balance read failed: {e}")
-                _eq, _bal = None, None
-            self.ftmo.on_tick(last.ts.replace(tzinfo=timezone.utc)
-                              if last.ts.tzinfo is None else last.ts,
-                              _eq, _bal)
-            # If a breach/target tripped, force-close any open live positions now
-            can_trade_ftmo, _reason = self.ftmo.can_open_trade()
-            if not can_trade_ftmo and self._open_positions:
-                logger.warning(f"[FTMO] {_reason} — force-closing open positions")
-                for _sn in list(self._open_positions.keys()):
-                    self._force_close(_sn, last)
-                self.notifier.send(f"🛡️ FTMO guard: {_reason}\nClosed open positions.")
-
         # ── Process open live positions (EOD close, fill checks) ───────────
         for sn in list(self._open_positions.keys()):
             strategy = self._find_strategy(sn)
@@ -265,13 +218,6 @@ class Engine:
         if not ok: return
 
         # ── Run live strategies independently (with daily loss gate) ───────
-        # ── FTMO trade gate (only when guard active) ──
-        if self.ftmo is not None:
-            ok_ftmo, reason = self.ftmo.can_open_trade()
-            if not ok_ftmo:
-                logger.info(f"[FTMO] trading blocked: {reason}")
-                return
-
         for strategy in self.live_strategies:
             sn = strategy.strategy_name
 
@@ -303,20 +249,6 @@ class Engine:
         if lots < info.get("min_lot", 0.01):
             logger.warning(f"[{sig.strategy}] lots too small: {lots}")
             return
-
-        # ── FTMO projected-risk check: would this trade's worst-case stop
-        #    breach a daily/overall floor? If so, skip it (only when armed). ──
-        if self.ftmo is not None:
-            try:
-                _eq = self.broker.account_equity()
-                _trade_risk = (sig.risk_dist / info["point"]) * info["tick_value"] * lots
-                ok_risk, why = self.ftmo.trade_risk_ok(_eq, _trade_risk)
-                if not ok_risk:
-                    logger.warning(f"[{sig.strategy}] FTMO skip: {why}")
-                    return
-            except Exception as e:
-                logger.warning(f"[{sig.strategy}] FTMO risk check failed, skipping trade: {e}")
-                return
 
         pos = self.broker.place_market(
             self.symbol, sig.side, lots, sig.sl, sig.tp,
@@ -358,8 +290,6 @@ class Engine:
             self._recovery_trade_taken = True
             logger.info(f"[{sig.strategy}] Recovery trade opened after today's loss")
         self.risk.record_trade_open()
-        if self.ftmo is not None:
-            self.ftmo.record_trade_day()
 
         self.notifier.send(
             f"📥 *[{sig.strategy}]* {sig.side.value} `{self.symbol}` {lots} lots\n"

@@ -10,7 +10,7 @@ from typing import List, Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
+import os
 
 def _parse_time(s: str) -> time:
     hh, mm = s.split(":")
@@ -19,7 +19,7 @@ def _parse_time(s: str) -> time:
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=os.environ.get("ENV_FILE", ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -84,6 +84,14 @@ class Settings(BaseSettings):
     # logging
     LOG_LEVEL: str = "INFO"
     LOG_DIR: str = "./logs"
+
+    FTMO_MODE: bool = False
+    FTMO_DAILY_LOSS_PCT: float = 0.05
+    FTMO_MAX_LOSS_PCT: float = 0.10
+    FTMO_PROFIT_TARGET_PCT: float = 0.05
+    FTMO_MIN_TRADING_DAYS: int = 2
+    FTMO_DAILY_BUFFER_PCT: float = 0.04
+    FTMO_MAX_BUFFER_PCT: float = 0.08
 
     # ---- helpers ----
     @property

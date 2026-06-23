@@ -1,17 +1,26 @@
-"""Main engine — multi-strategy with independent firing + daily loss gate.
+"""Main engine — multi-strategy with priority system.
 
-LIVE strategies (real orders, all fire independently):
-  1. ORB_5MIN_LIVE           — first 5-min NY ORB, 15-min delay, RR=1.0
-  2. PREV_DAY_BREAKOUT       — previous day H/L breakout, RR=1.5
+LIVE strategies (real orders, priority order):
+  1. ORB_5MIN_LIVE    — first 5-min NY ORB, 15-min delay, RR=1.0
+  2. PREV_DAY_BREAKOUT — previous day H/L breakout, RR=1.5
   3. PREV_WEEK_BREAKOUT_LIVE — previous week H/L breakout, RR=1.5
-  4. FVG_RETEST              — bearish/bullish FVG retest, RR=1.5
 
-DAILY LOSS GATE:
-  - First trade of the day: allowed
-  - After a WIN: next trade allowed (no cap on wins)
-  - After a LOSS: one recovery trade allowed
-  - If recovery also loses: blocked until next day
-  - Any WIN resets the recovery slot
+PAPER strategies (no real orders, validation only):
+  4. FVG_RETEST_PAPER
+  5. ORB_5MIN_PAPER       (redundant once live, but kept for comparison)
+  6. PREV_WEEK_BREAKOUT_PAPER (redundant once live)
+
+PRIORITY SYSTEM:
+  - Only one live trade can be open at any time
+  - On each new bar, strategies are checked in priority order
+  - If strategy 1 fires, strategies 2 and 3 are skipped for the day
+  - If strategy 1 misses (no setup), strategy 2 gets a chance
+  - If both 1 and 2 miss, strategy 3 gets a chance
+  - Paper strategies always run independently, regardless of live trades
+
+CURRENT CONFIG (all live strategies in paper mode for validation):
+  Change paper=True → paper=False on individual strategies to go live.
+  Recommended order: validate ORB_5MIN paper for 4 weeks, then go live.
 """
 from __future__ import annotations
 
@@ -21,7 +30,7 @@ import threading
 import time as time_mod
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
-from app.strategy.twk_momentum import TWKMomentumStrategy
+
 import uvicorn
 from loguru import logger
 
@@ -39,7 +48,6 @@ from app.strategy.fvg_retest import FVGRetestStrategy
 from app.strategy.prev_week_breakout import PrevWeekBreakoutStrategy
 from app.strategy.orb_5min import ORB5MinStrategy
 from app.strategy.risk import RiskManager
-from app.strategy.ftmo_guard import FTMOGuard, FTMOConfig
 
 
 KILL_FILE = "./KILL"
@@ -71,16 +79,17 @@ class Engine:
         self.notifier = notifier
 
         # ── Strategy registry ──────────────────────────────────────────────
-        # All live strategies fire independently. Daily loss gate controls flow.
+        # live_strategies: checked in PRIORITY ORDER, max one trade/day across all
+        # paper_strategies: run independently, never place real orders
         self.live_strategies = [
             ORB5MinStrategy(rr=1.0, risk_pct=settings.RISK_PER_TRADE, paper=False),
             PrevDayBreakoutStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE),
             PrevWeekBreakoutStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE, paper=False),
-            FVGRetestStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE, paper=False),
         ]
 
         self.paper_strategies = [
-            TWKMomentumStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE, paper=True),
+            # Independent paper validation — always run regardless of live trades
+            FVGRetestStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE, paper=True),
         ]
 
         # Inject broker into strategies that need MT5 history
@@ -92,9 +101,8 @@ class Engine:
         self.symbol = settings.PRIMARY_SYMBOL
 
         self._last_bar_ts: Optional[datetime] = None
-        self._open_positions: Dict[str, dict] = {}           # strategy_name → meta
-        self._last_outcome_today: Optional[str] = None       # 'WIN' | 'LOSS' | None
-        self._recovery_trade_taken: bool = False             # one-shot after a loss
+        self._open_positions: Dict[str, dict] = {}  # strategy_name → meta
+        self._live_traded_today = False              # guards the priority system
         self._current_day = ""
 
         self._stop   = threading.Event()
@@ -104,49 +112,22 @@ class Engine:
         engine_state.risk    = self.risk
         engine_state.running = True
 
-        # ── FTMO prop-challenge guard (active only when FTMO_MODE is set) ──
-        # When enabled via .env, enforces equity-based daily loss, static
-        # overall drawdown, profit-target stop, and min-trading-days — all
-        # with conservative buffers BELOW the FTMO hard limits. Disabled by
-        # default so the normal demo/live behaviour is byte-for-byte unchanged.
-        self.ftmo = None
-        if getattr(settings, "FTMO_MODE", False):
-            init_bal = self.broker.account_balance() or self.broker.account_equity() \
-                       or settings.STARTING_EQUITY
-            self.ftmo = FTMOGuard(FTMOConfig(
-                initial_balance=float(init_bal),
-                daily_loss_pct=getattr(settings, "FTMO_DAILY_LOSS_PCT", 0.05),
-                max_loss_pct=getattr(settings, "FTMO_MAX_LOSS_PCT", 0.10),
-                profit_target_pct=getattr(settings, "FTMO_PROFIT_TARGET_PCT", 0.05),
-                min_trading_days=getattr(settings, "FTMO_MIN_TRADING_DAYS", 2),
-                daily_buffer_pct=getattr(settings, "FTMO_DAILY_BUFFER_PCT", 0.04),
-                max_buffer_pct=getattr(settings, "FTMO_MAX_BUFFER_PCT", 0.08),
-            ))
-
     @property
     def _all_strategies(self):
         return self.live_strategies + self.paper_strategies
 
     def start(self) -> None:
         live_names  = ", ".join(s.strategy_name for s in self.live_strategies)
-        paper_names = ", ".join(s.strategy_name for s in self.paper_strategies) or "(none)"
+        paper_names = ", ".join(s.strategy_name for s in self.paper_strategies)
         self.notifier.send(
             f"🟢 ORB Bot v2 — *{settings.MODE}*\n"
-            f"📊 Live: {live_names}\n"
+            f"📊 Live (priority): {live_names}\n"
             f"📋 Paper: {paper_names}\n"
             f"Equity: ${self.broker.account_equity():,.2f}"
         )
         logger.info(f"Engine starting. Mode={settings.MODE}")
-        logger.info(f"Live strategies: {live_names}")
+        logger.info(f"Live strategies (priority order): {live_names}")
         logger.info(f"Paper strategies: {paper_names}")
-        if self.ftmo is not None:
-            logger.info(f"FTMO GUARD ARMED — initial=${self.ftmo.cfg.initial_balance:,.0f} "
-                        f"daily_stop={self.ftmo.cfg.daily_buffer_pct*100:.0f}% "
-                        f"overall_stop={self.ftmo.cfg.max_buffer_pct*100:.0f}% "
-                        f"target={self.ftmo.cfg.profit_target_pct*100:.0f}%")
-            self.notifier.send(f"🛡️ FTMO guard armed: ${self.ftmo.cfg.initial_balance:,.0f} "
-                               f"account, stop at {self.ftmo.cfg.daily_buffer_pct*100:.0f}% daily / "
-                               f"{self.ftmo.cfg.max_buffer_pct*100:.0f}% overall")
         self._ensure_symbol()
 
         while not self._stop.is_set():
@@ -181,21 +162,6 @@ class Engine:
         except Exception as e:
             logger.error(f"Symbol {self.symbol} not available: {e}")
 
-    def _can_open_new_trade(self) -> bool:
-        """
-        Trading gate logic:
-        - No trades yet today          → allow
-        - Last trade was WIN           → allow
-        - Last trade was LOSS          → allow one recovery trade only
-        - Recovery trade already taken → block for the rest of the day
-        """
-        if self._last_outcome_today is None:
-            return True
-        if self._last_outcome_today == "WIN":
-            return True
-        # last outcome was LOSS
-        return not self._recovery_trade_taken
-
     def _tick(self) -> None:
         if os.path.exists(KILL_FILE):
             if not self.risk.state.paused:
@@ -212,31 +178,11 @@ class Engine:
 
         day = last.ts.strftime("%Y-%m-%d")
         if day != self._current_day:
-            self._current_day = day
-            self._last_outcome_today = None
-            self._recovery_trade_taken = False
+            self._current_day    = day
+            self._live_traded_today = False
             eq = self.broker.account_equity()
             self.risk.on_new_day(eq)
             logger.info(f"New day: {day}, equity=${eq:,.2f}")
-
-        # ── FTMO guard: update on every tick with live equity/balance ──
-        if self.ftmo is not None:
-            try:
-                _eq = self.broker.account_equity()
-                _bal = self.broker.account_balance()
-            except Exception as e:
-                logger.warning(f"[FTMO] equity/balance read failed: {e}")
-                _eq, _bal = None, None
-            self.ftmo.on_tick(last.ts.replace(tzinfo=timezone.utc)
-                              if last.ts.tzinfo is None else last.ts,
-                              _eq, _bal)
-            # If a breach/target tripped, force-close any open live positions now
-            can_trade_ftmo, _reason = self.ftmo.can_open_trade()
-            if not can_trade_ftmo and self._open_positions:
-                logger.warning(f"[FTMO] {_reason} — force-closing open positions")
-                for _sn in list(self._open_positions.keys()):
-                    self._force_close(_sn, last)
-                self.notifier.send(f"🛡️ FTMO guard: {_reason}\nClosed open positions.")
 
         # ── Process open live positions (EOD close, fill checks) ───────────
         for sn in list(self._open_positions.keys()):
@@ -264,27 +210,34 @@ class Engine:
         ok, _ = self.risk.can_trade(last.ts)
         if not ok: return
 
-        # ── Run live strategies independently (with daily loss gate) ───────
-        # ── FTMO trade gate (only when guard active) ──
-        if self.ftmo is not None:
-            ok_ftmo, reason = self.ftmo.can_open_trade()
-            if not ok_ftmo:
-                logger.info(f"[FTMO] trading blocked: {reason}")
-                return
-
+        # ── Run live strategies in PRIORITY ORDER ──────────────────────────
+        # Paper-flagged live strategies also handle their own sim but still
+        # participate in the priority queue (they just don't place real orders)
         for strategy in self.live_strategies:
             sn = strategy.strategy_name
 
+            # Skip if this strategy already has an open position
             if sn in self._open_positions: continue
 
-            if not self._can_open_new_trade():
-                logger.info(f"[{sn}] Skipped — daily loss gate active")
+            # Priority gate: if any live non-paper strategy already traded
+            # today, skip all lower-priority strategies
+            if self._live_traded_today and not _is_paper(strategy):
                 continue
 
             sig = strategy.on_bar(last, self.symbol)
 
             if sig is not None:
+                # Paper strategies return None (handle internally),
+                # but if a live strategy returns a signal, execute it
                 self._execute(strategy, sig)
+                if not _is_paper(strategy):
+                    self._live_traded_today = True
+                    # Signal to remaining lower-priority strategies to skip
+                    logger.info(
+                        f"[{sn}] Live trade taken — lower priority strategies "
+                        f"skipped for today"
+                    )
+                    break
 
     def _find_strategy(self, name: str):
         for s in self._all_strategies:
@@ -304,20 +257,6 @@ class Engine:
             logger.warning(f"[{sig.strategy}] lots too small: {lots}")
             return
 
-        # ── FTMO projected-risk check: would this trade's worst-case stop
-        #    breach a daily/overall floor? If so, skip it (only when armed). ──
-        if self.ftmo is not None:
-            try:
-                _eq = self.broker.account_equity()
-                _trade_risk = (sig.risk_dist / info["point"]) * info["tick_value"] * lots
-                ok_risk, why = self.ftmo.trade_risk_ok(_eq, _trade_risk)
-                if not ok_risk:
-                    logger.warning(f"[{sig.strategy}] FTMO skip: {why}")
-                    return
-            except Exception as e:
-                logger.warning(f"[{sig.strategy}] FTMO risk check failed, skipping trade: {e}")
-                return
-
         pos = self.broker.place_market(
             self.symbol, sig.side, lots, sig.sl, sig.tp,
             comment=f"{sig.strategy[:8]}_{sig.side.value}",
@@ -327,39 +266,12 @@ class Engine:
             self.notifier.send(f"⚠️ [{sig.strategy}] Order rejected")
             return
 
-        # Re-anchor SL/TP to the ACTUAL fill price. Market orders can fill
-        # past the intended entry on fast breakouts; if we keep the SL/TP
-        # computed from the intended entry, the realized RR is distorted
-        # (wins book partial-R while losses are full-R). Recompute both
-        # stops from pos.entry, preserving the strategy's intended risk_dist.
-        try:
-            slippage = abs(pos.entry - sig.entry)
-            if slippage > info["point"] * 2 and hasattr(self.broker, "modify_sl_tp"):
-                if sig.side == Side.BUY:
-                    new_sl = pos.entry - sig.risk_dist
-                    new_tp = pos.entry + sig.risk_dist * strategy.rr
-                else:
-                    new_sl = pos.entry + sig.risk_dist
-                    new_tp = pos.entry - sig.risk_dist * strategy.rr
-                if self.broker.modify_sl_tp(pos.ticket, new_sl, new_tp):
-                    logger.info(f"[{sig.strategy}] Re-anchored after ${slippage:.2f} "
-                                f"slippage: entry={pos.entry:.2f} SL={new_sl:.2f} TP={new_tp:.2f}")
-                    sig.sl = new_sl
-                    sig.tp = new_tp
-        except Exception as e:
-            logger.warning(f"[{sig.strategy}] SL/TP re-anchor failed: {e}")
-
         risk_ccy = (sig.risk_dist / info["point"]) * info["tick_value"] * lots
         self._open_positions[sig.strategy] = {
             "ticket": pos.ticket, "signal": sig, "lots": lots,
             "entry": pos.entry, "risk_ccy": max(risk_ccy, 1e-9),
         }
-        if self._last_outcome_today == "LOSS":
-            self._recovery_trade_taken = True
-            logger.info(f"[{sig.strategy}] Recovery trade opened after today's loss")
         self.risk.record_trade_open()
-        if self.ftmo is not None:
-            self.ftmo.record_trade_day()
 
         self.notifier.send(
             f"📥 *[{sig.strategy}]* {sig.side.value} `{self.symbol}` {lots} lots\n"
@@ -400,9 +312,6 @@ class Engine:
         r       = pnl / meta.get("risk_ccy", 1e-9)
         outcome = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BE")
         emoji   = "✅" if pnl > 0 else ("❌" if pnl < 0 else "➖")
-        self._last_outcome_today = "WIN" if pnl >= 0 else "LOSS"
-        if self._last_outcome_today == "WIN":
-            self._recovery_trade_taken = False  # WIN resets recovery slot
         self.risk.record_trade_close(pnl)
         eq = self.broker.account_equity()
         self.notifier.send(

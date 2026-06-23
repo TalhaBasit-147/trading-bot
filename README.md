@@ -1,99 +1,102 @@
-# SMC Bot — Liquidity • Order Blocks • Fair Value Gaps
+# XAUUSD Previous Day Breakout Bot
 
-Production-grade intraday trading bot for **XAUUSD** and major forex pairs.
-Uses Smart Money Concepts (SMC): liquidity sweeps, order blocks, fair value gaps,
-with market-structure confirmation (BOS/CHoCH) and a LightGBM probability filter
-that learns from closed trades.
+An automated gold trading bot for MetaTrader 5 built on the Previous Day
+High/Low breakout strategy. Runs on a Windows VPS, trades XAUUSD, and sends
+Telegram alerts on every trade.
 
-Execution through **MetaTrader 5** (demo first, then live). Includes a paper broker
-for development on any OS and a full event-driven backtester.
+## Live Results
 
----
+- Starting balance: $150 (demo account, IC Markets)
+- Current balance: $222
+- Net profit: +$72 (~48% return)
+- Strategy live since: May 2026
+- Backtest (Feb-May 2026): 65% win rate, 72 trades
 
-## Quick start (local, paper mode, no MT5 required)
+## What the bot does
 
-```bash
-# 1. Clone & install
-git clone <your-repo> smc-bot && cd smc-bot
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+- Detects breakouts above previous day high or below previous day low
+- Enters trades automatically during the NY session
+- Sets SL and TP automatically based on configurable RR ratio (default 1.2)
+- Skips trading 30 minutes before/after high-impact news (NFP, CPI, FOMC)
+- Sends Telegram message on every entry and exit
+- Logs all trades to local database
+
+## Requirements
+
+- Windows PC or Windows VPS (required for MT5)
+- MetaTrader 5 installed and logged into your broker account
+- Python 3.11+
+- IC Markets or any MT5 broker (XAUUSD must be available)
+- Telegram bot (free, setup instructions below)
+- News API key from forex-calendar.pro (free tier works)
+
+## Setup
+
+### 1. Install Python dependencies
+
 pip install -r requirements.txt
 
-# 2. Configure
-cp .env.example .env
-# edit .env — MODE=paper is the default, no broker needed
+### 2. Configure your .env file
 
-# 3. Initialize DB (SQLite by default)
-python scripts/init_db.py
+Copy .env.example to .env:
 
-# 4. Backtest on sample CSV data
-python scripts/run_backtest.py --symbol XAUUSD --csv data/XAUUSD_M1.csv
-
-# 5. Paper trade with synthetic/replayed data
-python scripts/run_paper.py
-```
-
-## Live (MT5) on Windows VPS
-
-```powershell
-# Install Python 3.11 x64 + MetaTrader 5 terminal
-pip install -r requirements.txt
-# Login MT5 terminal to your demo/live account, enable AutoTrading
 copy .env.example .env
-# set MODE=live, MT5_LOGIN, MT5_PASSWORD, MT5_SERVER
-python scripts/run_live.py
-```
 
-## Docker (engine, Linux — paper/backtest only; MT5 is Windows-only)
+Open .env and fill in:
+- MT5_LOGIN: your MT5 account number
+- MT5_PASSWORD: your MT5 password
+- MT5_SERVER: your broker server name (visible on MT5 login screen)
+- MT5_PATH: full path to terminal64.exe (leave blank to auto-detect)
+- TELEGRAM_BOT_TOKEN: from @BotFather on Telegram
+- TELEGRAM_CHAT_ID: your Telegram user ID (get from @userinfobot)
+- NEWS_API_KEY: from forex-calendar.pro (free registration)
+- STARTING_EQUITY: your account starting balance in USD
 
-```bash
-docker compose -f docker/docker-compose.yml up -d
-```
+### 3. Export historical data (for backtest only)
 
-## Architecture
+With MT5 open and logged in, run:
 
-```
-MT5 Terminal ── Python MetaTrader5 pkg ──┐
-                                         ▼
- 1m ticks/bars ─▶ Resampler(15m) ─▶ Features(SMC) ─▶ Strategy ─▶ Risk ─▶ Broker
-                                         │                │
-                                         ▼                ▼
-                                    PostgreSQL ◀── Trade outcomes
-                                         │
-                                         ▼
-                                    Nightly Learner (LightGBM)
-                                         │
-                                         ▼
-                                    Scorer (live P(win) filter)
-```
+python scripts/export_chunks.py
 
-## Strategy in one paragraph
+### 4. Run a backtest (optional but recommended)
 
-On the 15-minute chart we track swings and bias. When price sweeps an obvious
-liquidity pool (equal highs/lows) and the next leg shows displacement (body ≥
-1.5× avg body), we mark the last opposite candle as an **order block** and
-check for a **fair value gap** inside the displacement. When price returns
-into the OB/FVG overlap and prints a 1-minute CHoCH against the retrace, we
-enter. SL goes beyond the sweep wick, TP targets opposite liquidity.
-Minimum RR is 2.0. We only trade London & NY sessions.
+$env:PYTHONPATH = "."; python -m scripts.run_backtest --csv data/XAUUSD_M1_ALL.csv
 
-Full strategy docs are in [`docs/STRATEGY.md`](docs/STRATEGY.md) (auto-generated
-from the code — see `app/strategy/smc_strategy.py`).
+### 5. Start the bot
 
-## Day-to-day operation
+$env:PYTHONPATH = "."; python scripts/run_live.py
 
-- Bot runs 24/7 on the VPS. It is session-aware and stays idle outside London/NY.
-- Telegram notifies on: startup, new signal, entry, exit, daily summary, errors.
-- Control plane: `GET /health`, `POST /pause`, `POST /resume`, `GET /trades`.
-- Nightly: learner retrains if ≥ 20 new closed trades exist. Drift guard auto
-  flips to paper if live win-rate degrades >15% vs backtest.
-- Log rotation via loguru (`logs/bot.log`, 10 MB × 10 files).
+The bot will connect to MT5, wait for the next breakout signal, and trade
+automatically. Leave it running on your VPS 24/7.
 
-## Safety
+## Risk settings (in .env)
 
-- Daily loss cap, weekly loss cap, consecutive-loss cool-down, kill switch file
-  (`./KILL`), spread guard, news-time pause (configurable), auto-pause on broker
-  errors.
+Setting            | Default | Description
+RISK_PER_TRADE     | 0.02    | 2% of balance per trade
+MAX_DAILY_LOSS     | 0.06    | Stop trading if down 6% in a day
+MAX_WEEKLY_LOSS    | 0.10    | Stop trading if down 10% in a week
+MAX_TRADES_PER_DAY | 1       | Max 1 trade per day
+RR_TARGET          | 1.2     | Risk to Reward ratio
 
-## License
+## Telegram setup (5 minutes)
 
-MIT — use at your own risk. Trading involves substantial risk of loss.
+1. Open Telegram, search @BotFather
+2. Send /newbot, follow the prompts, copy the token
+3. Search @userinfobot, start it, copy your Chat ID
+4. Paste both into your .env file
+
+## News API setup (2 minutes)
+
+1. Go to forex-calendar.pro
+2. Register for a free account
+3. Copy your API key into NEWS_API_KEY in .env
+
+## Disclaimer
+
+This bot was tested on a demo account. Past results do not guarantee future
+performance. Always test on a demo account before using real funds. You are
+responsible for your own trading decisions.
+
+## Support
+
+If you have setup issues contact via the platform you purchased from.
