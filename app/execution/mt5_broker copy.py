@@ -262,109 +262,12 @@ class MT5Broker(Broker):
             logger.error(f"order_send failed: {getattr(result, 'retcode', None)} {getattr(result, 'comment', '')} "
                          f"(price={price} sl={sl} tp={tp} min_dist={min_dist})")
             return None
-
-        # ── Resolve the ACTUAL fill price ──────────────────────────────────
-        # On some brokers (FTMO / ECN market execution) result.price comes back
-        # as 0.0 even though the deal filled. Trusting it gives entry=0.0, which
-        # poisons slippage math, SL/TP re-anchoring (10016 Invalid stops), and
-        # every downstream P/L calculation. Resolve in priority order:
-        #   result.price -> executed deal -> open position -> request price.
-        ticket = result.order
-        fill_price = float(getattr(result, "price", 0.0) or 0.0)
-        if fill_price <= 0.0:
-            fill_price = self._resolve_fill_price(result, ticket)
-        if fill_price <= 0.0:
-            # Last resort: the price we requested. The broker's SL/TP from the
-            # original request are already attached, so the position is safe;
-            # this just keeps entry sane for accounting.
-            fill_price = price
-            logger.warning(f"[MT5] #{ticket} fill price unresolved, "
-                           f"falling back to request price {price}")
-
-        logger.info(f"[MT5] OPEN #{ticket} {side.value} {lots} {symbol} @ {fill_price} sl={sl} tp={tp}")
+        logger.info(f"[MT5] OPEN #{result.order} {side.value} {lots} {symbol} @ {result.price} sl={sl} tp={tp}")
         return Position(
-            symbol=symbol, side=side, qty=lots, entry=fill_price,
+            symbol=symbol, side=side, qty=lots, entry=result.price,
             sl=sl, tp=tp, open_ts=datetime.now(timezone.utc),
-            ticket=ticket, comment=comment,
+            ticket=result.order, comment=comment,
         )
-
-    def _resolve_fill_price(self, result, ticket: int) -> float:
-        """Recover the real fill price when order_send returns price=0.0.
-
-        Tries the executed deal first (most accurate), then the open position.
-        Deal/position history can lag the order ack slightly, so we retry.
-        """
-        # 1) Deal from this order's execution
-        try:
-            deal_ticket = int(getattr(result, "deal", 0) or 0)
-            if deal_ticket:
-                for _ in range(5):
-                    deals = mt5.history_deals_get(ticket=deal_ticket)  # type: ignore
-                    if deals:
-                        dp = float(getattr(deals[0], "price", 0.0) or 0.0)
-                        if dp > 0.0:
-                            return dp
-                    time.sleep(0.1)
-        except Exception as e:
-            logger.debug(f"[MT5] deal lookup failed for #{ticket}: {e}")
-
-        # 2) Open position price_open
-        try:
-            for _ in range(5):
-                positions = mt5.positions_get(ticket=int(ticket))  # type: ignore
-                if positions:
-                    pp = float(getattr(positions[0], "price_open", 0.0) or 0.0)
-                    if pp > 0.0:
-                        return pp
-                time.sleep(0.1)
-        except Exception as e:
-            logger.debug(f"[MT5] position lookup failed for #{ticket}: {e}")
-
-        return 0.0
-
-    def realized_pnl(self, ticket: int) -> Optional[float]:
-        """Return the REALIZED profit for a closed position, read from MT5 deal
-        history (the single source of truth). Sums profit + commission + swap
-        across all deals tied to this position.
-
-        Returns None if the realized P/L cannot be determined, so callers can
-        distinguish "unknown" from a genuine $0.00 break-even. Never recompute
-        P/L from entry/tick — that is what produced the bogus -271R figures.
-        """
-        try:
-            # Deals are linked to the originating position via position_id.
-            deals = mt5.history_deals_get(position=int(ticket))  # type: ignore
-            if not deals:
-                # Retry briefly: closing deal can lag the positions_get removal.
-                for _ in range(5):
-                    time.sleep(0.1)
-                    deals = mt5.history_deals_get(position=int(ticket))  # type: ignore
-                    if deals:
-                        break
-            if not deals:
-                logger.warning(f"[MT5] realized_pnl: no deals for position #{ticket}")
-                return None
-
-            # Entry deals (DEAL_ENTRY_IN) carry no profit; exit/partial deals do.
-            # Summing profit+commission+swap across all deals gives true net P/L.
-            total = 0.0
-            saw_out = False
-            for d in deals:
-                entry_type = getattr(d, "entry", None)
-                profit = float(getattr(d, "profit", 0.0) or 0.0)
-                commission = float(getattr(d, "commission", 0.0) or 0.0)
-                swap = float(getattr(d, "swap", 0.0) or 0.0)
-                total += profit + commission + swap
-                if entry_type in (getattr(mt5, "DEAL_ENTRY_OUT", 1),
-                                  getattr(mt5, "DEAL_ENTRY_OUT_BY", 4)):
-                    saw_out = True
-            if not saw_out:
-                logger.warning(f"[MT5] realized_pnl: position #{ticket} has no closing deal yet")
-                return None
-            return total
-        except Exception as e:
-            logger.warning(f"[MT5] realized_pnl failed for #{ticket}: {e}")
-            return None
 
     def modify_sl_tp(self, ticket: int, sl: float, tp: float) -> bool:
         """Modify SL/TP of an open position. Returns True on success.

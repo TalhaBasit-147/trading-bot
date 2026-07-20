@@ -334,19 +334,7 @@ class Engine:
         # stops from pos.entry, preserving the strategy's intended risk_dist.
         try:
             slippage = abs(pos.entry - sig.entry)
-            # Sanity bound: real XAUUSD slippage is at most a few dollars. A
-            # "slippage" larger than half the stop distance means the fill price
-            # is implausible (e.g. a 0.0 that slipped through) — never re-anchor
-            # on that, or we compute stops off a garbage entry (10016 Invalid).
-            max_sane_slip = max(sig.risk_dist * 0.5, info["point"] * 50)
-            if pos.entry <= 0.0 or slippage > max_sane_slip:
-                logger.warning(
-                    f"[{sig.strategy}] Skipping re-anchor: implausible fill "
-                    f"(entry={pos.entry:.2f} intended={sig.entry:.2f} "
-                    f"slip=${slippage:.2f} max=${max_sane_slip:.2f}). "
-                    f"Keeping broker's original SL/TP."
-                )
-            elif slippage > info["point"] * 2 and hasattr(self.broker, "modify_sl_tp"):
+            if slippage > info["point"] * 2 and hasattr(self.broker, "modify_sl_tp"):
                 if sig.side == Side.BUY:
                     new_sl = pos.entry - sig.risk_dist
                     new_tp = pos.entry + sig.risk_dist * strategy.rr
@@ -387,25 +375,16 @@ class Engine:
         meta = self._open_positions.get(sn)
         if not meta: return
         if meta["ticket"] not in {p.ticket for p in self.broker.open_positions(self.symbol)}:
-            # Source of truth: realized P/L from broker deal history. Only if
-            # that is unavailable do we fall back to recomputing from the entry
-            # and current tick — that fallback is an APPROXIMATION and was the
-            # source of the bogus -271R figures when entry was 0.0, so it is a
-            # last resort, not the primary path.
-            pnl = self.broker.realized_pnl(meta["ticket"])
-            if pnl is None:
-                sig  = meta["signal"]
-                info = self.broker.symbol_info(self.symbol)
-                try:
-                    tick = self.broker.tick(self.symbol)
-                    ep   = tick["bid"] if sig.side == Side.BUY else tick["ask"]
-                    pts  = (ep - meta["entry"]) / info["point"]
-                    if sig.side == Side.SELL: pts = -pts
-                    pnl  = pts * info["tick_value"] * meta["lots"]
-                    logger.warning(f"[{sn}] realized_pnl unavailable, approximated "
-                                   f"close P/L from tick: ${pnl:+.2f}")
-                except Exception:
-                    pnl = 0.0
+            sig  = meta["signal"]
+            info = self.broker.symbol_info(self.symbol)
+            try:
+                tick = self.broker.tick(self.symbol)
+                ep   = tick["bid"] if sig.side == Side.BUY else tick["ask"]
+                pts  = (ep - meta["entry"]) / info["point"]
+                if sig.side == Side.SELL: pts = -pts
+                pnl  = pts * info["tick_value"] * meta["lots"]
+            except Exception:
+                pnl = 0.0
             self._record_close(sn, meta["ticket"], pnl, None)
 
     def _force_close(self, sn: str, bar: Bar) -> None:
@@ -413,12 +392,6 @@ class Engine:
         if not meta: return
         logger.info(f"[{sn}] Force closing #{meta['ticket']} at EOD")
         pnl = self.broker.close(meta["ticket"])
-        # Prefer the realized figure from deal history (includes the closing
-        # deal's commission/swap); broker.close() may return only running
-        # profit at the close instant. Fall back to that if history is unread.
-        realized = self.broker.realized_pnl(meta["ticket"])
-        if realized is not None:
-            pnl = realized
         self._record_close(sn, meta["ticket"], pnl, bar)
 
     def _record_close(self, sn: str, ticket: int, pnl: float, bar: Optional[Bar]) -> None:
@@ -432,9 +405,6 @@ class Engine:
             self._recovery_trade_taken = False  # WIN resets recovery slot
         self.risk.record_trade_close(pnl)
         eq = self.broker.account_equity()
-        # Authoritatively mirror the broker's real equity into the RiskManager
-        # so a wrong per-trade P/L can never corrupt the daily/weekly loss caps.
-        self.risk.sync_equity(eq)
         self.notifier.send(
             f"{emoji} *[{sn}] {outcome}* pnl=`${pnl:+.2f}` (`{r:+.2f}R`)\n"
             f"Equity: `${eq:,.2f}`"

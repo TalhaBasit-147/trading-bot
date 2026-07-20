@@ -70,18 +70,6 @@ class RiskManager:
     def update_equity(self, equity: float) -> None:
         self.state.equity = equity
 
-    def sync_equity(self, equity: float) -> None:
-        """Authoritatively set tracked equity from the broker (single source of
-        truth). Use after every trade close so a wrong per-trade P/L can never
-        corrupt the running equity that drives the daily/weekly loss caps.
-
-        Statistics (daily.pnl_ccy, losses_in_a_row) are still maintained from
-        per-trade P/L in record_trade_close, but the equity used for risk
-        decisions always mirrors the broker.
-        """
-        if equity is not None and equity > 0:
-            self.state.equity = float(equity)
-
     # ---------- decisions ----------
 
     def can_trade(self, now: Optional[datetime] = None) -> tuple[bool, str]:
@@ -146,11 +134,7 @@ class RiskManager:
         now = now or datetime.now(timezone.utc)
         self.state.open_positions = max(0, self.state.open_positions - 1)
         self.state.daily.pnl_ccy += pnl_ccy
-        # NOTE: equity is intentionally NOT updated here by summing pnl_ccy.
-        # A single wrong per-trade P/L (e.g. a bad fill price) used to poison
-        # the running equity and falsely trip the daily/weekly loss caps. The
-        # engine calls sync_equity(broker.account_equity()) right after this,
-        # so the equity that drives risk decisions always mirrors the broker.
+        self.state.equity += pnl_ccy
         if pnl_ccy < 0:
             self.state.daily.losses_in_a_row += 1
             self.state.daily.last_loss_ts = now

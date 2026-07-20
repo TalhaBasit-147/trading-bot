@@ -42,12 +42,3 @@ class Broker(ABC):
     def close(self, ticket: int) -> float: ...
     @abstractmethod
     def open_positions(self, symbol: Optional[str] = None) -> List[Position]: ...
-
-    def realized_pnl(self, ticket: int) -> Optional[float]:
-        """Realized net P/L for a closed position from broker history.
-
-        Optional capability. Default returns None ("unknown"); brokers that can
-        read true closed-deal profit (MT5) override this. Callers must treat
-        None as "fall back to another source", never as $0.00.
-        """
-        return None
