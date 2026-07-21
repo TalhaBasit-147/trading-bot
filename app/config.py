@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     MAX_TRADES_PER_DAY: int = 1
     MAX_CONCURRENT_TRADES: int = 1
     MIN_RR: float = 1.0
-    CONSEC_LOSS_COOLDOWN_HOURS: int = 0
+    CONSEC_LOSS_COOLDOWN_HOURS: int = 2
     MAX_SPREAD_POINTS_XAUUSD: int = 40
     MAX_SPREAD_POINTS_FOREX: int = 20
     RR_TARGET: float = 1.2
