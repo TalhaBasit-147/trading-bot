@@ -1,10 +1,15 @@
 """Main engine — multi-strategy with independent firing + daily loss gate.
 
 LIVE strategies (real orders, all fire independently):
-  1. ORB_5MIN_LIVE           — first 5-min NY ORB, 15-min delay, RR=1.0
-  2. PREV_DAY_BREAKOUT       — previous day H/L breakout, RR=1.5
+  1. ORB_5MIN_LIVE           — first 5-min NY ORB, 15-min delay, RR=settings.RR_TARGET
+  2. PREV_DAY_BREAKOUT       — previous day H/L breakout, RR=settings.RR_TARGET
   3. PREV_WEEK_BREAKOUT_LIVE — previous week H/L breakout, RR=1.5
   4. FVG_RETEST              — bearish/bullish FVG retest, RR=1.5
+
+ENTRY TIME CUTOFF:
+  - No NEW positions opened at/after settings.NO_NEW_ENTRY_AFTER_HOUR (UTC,
+    same clock the strategies use internally). Already-open trades run to
+    their SL/TP untouched.
 
 DAILY LOSS GATE:
   - First trade of the day: allowed
@@ -19,7 +24,7 @@ import os
 import signal
 import threading
 import time as time_mod
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from typing import Dict, List, Optional
 from app.strategy.twk_momentum import TWKMomentumStrategy
 import uvicorn
@@ -34,6 +39,7 @@ from app.execution.base import Broker
 from app.execution.paper_broker import PaperBroker
 from app.monitoring.logging_setup import setup_logging
 from app.notify.telegram import Telegram
+from app.strategy.broker_time import detect_broker_offset_hours, to_utc
 from app.strategy.prev_day_breakout import PrevDayBreakoutStrategy
 from app.strategy.fvg_retest import FVGRetestStrategy
 from app.strategy.prev_week_breakout import PrevWeekBreakoutStrategy
@@ -73,8 +79,8 @@ class Engine:
         # ── Strategy registry ──────────────────────────────────────────────
         # All live strategies fire independently. Daily loss gate controls flow.
         self.live_strategies = [
-            ORB5MinStrategy(rr=1.0, risk_pct=settings.RISK_PER_TRADE, paper=False),
-            PrevDayBreakoutStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE),
+            ORB5MinStrategy(rr=settings.RR_TARGET, risk_pct=settings.RISK_PER_TRADE, paper=False),
+            PrevDayBreakoutStrategy(rr=settings.RR_TARGET, risk_pct=settings.RISK_PER_TRADE),
             PrevWeekBreakoutStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE, paper=False),
             FVGRetestStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE, paper=False),
         ]
@@ -87,6 +93,11 @@ class Engine:
         for s in self.live_strategies + self.paper_strategies:
             if hasattr(s, "set_broker"):
                 s.set_broker(broker)
+
+        # Same broker-time detection the strategies use internally (broker_time.py),
+        # so the entry-time cutoff below reads the identical clock they already
+        # gate their own session windows on. Not a new/second conversion.
+        self._broker_offset = detect_broker_offset_hours(broker)
 
         self.risk   = RiskManager(starting_equity=broker.account_equity() or settings.STARTING_EQUITY)
         self.symbol = settings.PRIMARY_SYMBOL
@@ -271,6 +282,18 @@ class Engine:
             if not ok_ftmo:
                 logger.info(f"[FTMO] trading blocked: {reason}")
                 return
+
+        # ── Time-of-day entry cutoff (shared, applies to all live strategies) ──
+        # ENTRY filter only — positions already open are handled above and are
+        # left to hit their SL/TP normally; this only blocks NEW entries.
+        utc_ts = to_utc(last.ts, self._broker_offset)
+        cutoff = time(settings.NO_NEW_ENTRY_AFTER_HOUR, 0)
+        if utc_ts.time() >= cutoff:
+            logger.info(
+                f"[TIME_FILTER] Skipping entry — {utc_ts.strftime('%H:%M')} "
+                f">= cutoff {cutoff.strftime('%H:%M')}"
+            )
+            return
 
         for strategy in self.live_strategies:
             sn = strategy.strategy_name

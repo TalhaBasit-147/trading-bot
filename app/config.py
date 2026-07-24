@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     CONSEC_LOSS_COOLDOWN_HOURS: int = 2
     MAX_SPREAD_POINTS_XAUUSD: int = 40
     MAX_SPREAD_POINTS_FOREX: int = 20
-    RR_TARGET: float = 1.2
+    RR_TARGET: float = 2.0
     STARTING_EQUITY: float = 1000.0
 
     # sessions
@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     NY_OPEN: str = "12:30"
     NY_CLOSE: str = "16:00"
     BLOCK_ASIAN_SESSION: bool = True
+    # No NEW entries at/after this UTC hour (same clock strategies already use
+    # internally via broker_time.to_utc). Trades already open are left alone.
+    NO_NEW_ENTRY_AFTER_HOUR: int = 14
 
     # MT5
     MT5_LOGIN: int | None = None
