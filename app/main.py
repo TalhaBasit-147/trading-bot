@@ -40,7 +40,7 @@ from app.execution.base import Broker
 from app.execution.paper_broker import PaperBroker
 from app.monitoring.logging_setup import setup_logging
 from app.notify.telegram import Telegram
-from app.strategy.broker_time import detect_broker_offset_hours, to_utc
+from app.strategy.broker_time import detect_broker_offset_hours, has_confirmed_broker_offset, to_utc
 from app.strategy.prev_day_breakout import PrevDayBreakoutStrategy
 from app.strategy.fvg_retest import FVGRetestStrategy
 from app.strategy.prev_week_breakout import PrevWeekBreakoutStrategy
@@ -300,14 +300,27 @@ class Engine:
             # PREV_WEEK_BREAKOUT, FVG_RETEST) are unaffected and still get
             # evaluated this tick.
             if sn == "PREV_DAY_BREAKOUT":
-                utc_ts = to_utc(last.ts, self._broker_offset)
-                cutoff = time(settings.PREV_DAY_NO_ENTRY_AFTER_UTC_HOUR, 0)
-                if utc_ts.time() >= cutoff:
-                    logger.info(
-                        f"[TIME_FILTER] [{sn}] Skipping entry — "
-                        f"{utc_ts.strftime('%H:%M')} >= cutoff {cutoff.strftime('%H:%M')}"
+                if not has_confirmed_broker_offset():
+                    # No offset has ever been confirmed from live tick/bar data
+                    # this session — self._broker_offset is only a configured
+                    # guess. Fail OPEN (don't enforce the cutoff) rather than
+                    # silently gating every entry on a guess for the rest of
+                    # the session; this is exactly the failure mode that muted
+                    # PREV_DAY_BREAKOUT entirely last time.
+                    logger.error(
+                        f"[TIME_FILTER] [{sn}] No confirmed broker offset yet "
+                        f"(using unconfirmed fallback {self._broker_offset:+.1f}) "
+                        f"— NOT enforcing time cutoff this tick, failing open for safety review"
                     )
-                    continue
+                else:
+                    utc_ts = to_utc(last.ts, self._broker_offset)
+                    cutoff = time(settings.PREV_DAY_NO_ENTRY_AFTER_UTC_HOUR, 0)
+                    if utc_ts.time() >= cutoff:
+                        logger.info(
+                            f"[TIME_FILTER] [{sn}] Skipping entry — "
+                            f"{utc_ts.strftime('%H:%M')} >= cutoff {cutoff.strftime('%H:%M')}"
+                        )
+                        continue
 
             sig = strategy.on_bar(last, self.symbol)
 
