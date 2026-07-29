@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     # clock strategies already use internally via broker_time.to_utc).
     # Does NOT apply to ORB_5MIN, PREV_WEEK_BREAKOUT, or FVG_RETEST.
     PREV_DAY_NO_ENTRY_AFTER_UTC_HOUR: int = 11
+    # Used by broker_time.detect_broker_offset_hours() only when this process
+    # has never confirmed a real offset from a live tick/bar (e.g. very first
+    # tick, or broker data unavailable). IC Markets is UTC+3 in summer / +2 in
+    # winter (server DST) — this is a last-resort guess, not a hardcoded truth.
+    BROKER_OFFSET_FALLBACK_HOURS: float = 3.0
 
     # MT5
     MT5_LOGIN: int | None = None
