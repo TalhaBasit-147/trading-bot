@@ -20,7 +20,7 @@ Rules (sourced from Huddleston / ICT / Equiti / FundedTradingPlus):
    - Bearish: above c0.high + small buffer
    - This is critical — SL is NOT just past the entry candle
 
-4. Take profit: 1.5R (chosen over higher RR for live robustness)
+4. Take profit: 2.5R (raised from 1.5R after backtesting validation)
 
 5. Invalidation: if price closes through the FVG extreme before retest, kill setup
 
@@ -29,7 +29,8 @@ Rules (sourced from Huddleston / ICT / Equiti / FundedTradingPlus):
 
 7. One trade per day max. One FVG can only be traded once.
 
-Backtest on 73 days XAUUSD M1 (Feb-May 2026):
+Backtest on 73 days XAUUSD M1 (Feb-May 2026), AT RR=1.5 (now RR_TARGET=2.5,
+see rule 4 — these figures predate that change and haven't been re-run at 2.5):
    64 trades, 54.7% WR, +0.367R expectancy, PF 1.81
 """
 from __future__ import annotations
@@ -64,7 +65,7 @@ MIN_GAP_SIZE = 0.5       # minimum dollar size of the FVG to consider
 SL_BUFFER = 0.5          # dollars beyond FVG extreme
 MIN_RISK_DIST = 1.5
 MAX_RISK_DIST = 15.0
-RR_TARGET = 1.5
+RR_TARGET = 2.5
 
 # Paper-only by default. Set to False to enable live trading (NOT recommended yet)
 PAPER_MODE = True
@@ -249,7 +250,7 @@ class FVGRetestStrategy:
             self._m5_history = self._m5_history[-500:]
 
         # Check existing FVGs for invalidation or retest using this completed M5
-        self._update_active_fvgs(m5, symbol)
+        signal = self._update_active_fvgs(m5, symbol)
 
         # Detect new FVG on the most recent 3 bars
         new_fvg = self._detect_fvg()
@@ -266,15 +267,17 @@ class FVGRetestStrategy:
         # Check paper position fills (simulated SL/TP)
         self._check_paper_fills(bar)
 
-        # No new signal directly — signals fire from _update_active_fvgs
-        return None
+        # Live signals fire from _update_active_fvgs -> _fire_signal; propagate
+        # whatever it returned (None for paper mode / no fire / risk rejected).
+        return signal
 
-    def _update_active_fvgs(self, m5: M5Bar, symbol: str) -> None:
-        """For each active FVG, check invalidation or retest. Emit signals."""
+    def _update_active_fvgs(self, m5: M5Bar, symbol: str) -> Optional[TradeSignal]:
+        """For each active FVG, check invalidation or retest. Emits at most
+        one signal per call (one trade per day)."""
         if self._traded_today:
-            return
+            return None
         if not (SESSION_START <= m5.ts.time() < SESSION_END):
-            return
+            return None
 
         for fvg in self._active_fvgs:
             if fvg.state != "ACTIVE": continue
@@ -292,16 +295,17 @@ class FVGRetestStrategy:
             # Retest of CE level
             if fvg.side == 'bullish':
                 if m5.low <= fvg.ce <= m5.high or m5.low <= fvg.ce:
-                    self._fire_signal(fvg, m5, Side.BUY, symbol)
+                    signal = self._fire_signal(fvg, m5, Side.BUY, symbol)
                     fvg.state = "RETESTED"
-                    return  # one trade per day
+                    return signal  # one trade per day
             else:
                 if m5.low <= fvg.ce <= m5.high or m5.high >= fvg.ce:
-                    self._fire_signal(fvg, m5, Side.SELL, symbol)
+                    signal = self._fire_signal(fvg, m5, Side.SELL, symbol)
                     fvg.state = "RETESTED"
-                    return
+                    return signal
+        return None
 
-    def _fire_signal(self, fvg: FVG, m5: M5Bar, side: Side, symbol: str) -> None:
+    def _fire_signal(self, fvg: FVG, m5: M5Bar, side: Side, symbol: str) -> Optional[TradeSignal]:
         entry = fvg.ce
         if side == Side.BUY:
             sl = fvg.sl_anchor - SL_BUFFER
@@ -312,18 +316,28 @@ class FVGRetestStrategy:
 
         if risk < MIN_RISK_DIST or risk > MAX_RISK_DIST:
             logger.info(f"[{self.strategy_name}] Signal skipped — risk ${risk:.2f} out of bounds")
-            return
+            return None
 
         tp = entry + risk * self.rr if side == Side.BUY else entry - risk * self.rr
+        self._traded_today = True
 
         if self.paper:
             self._open_paper_trade(m5.ts, symbol, side, entry, sl, tp, risk, fvg)
-        else:
-            # Live mode — return signal for the engine to execute
-            # (not implemented for paper-mode default)
-            pass
+            return None
 
-        self._traded_today = True
+        # Live mode — return the signal so Engine._tick()/_execute() places the
+        # real order through the exact same path as ORB_5MIN and
+        # PREV_DAY_BREAKOUT (position sizing via compute_lots(), SL/TP via
+        # place_market(), MAX_TRADES_PER_DAY / daily-loss / FTMO guards all
+        # live in the engine, not here).
+        return TradeSignal(
+            ts=m5.ts, symbol=symbol, side=side,
+            entry=entry, sl=sl, tp=tp, risk_dist=risk,
+            strategy=self.strategy_name,
+            note=(f"FVG {fvg.side} CE={fvg.ce:.2f} "
+                  f"gap={fvg.fvg_low:.2f}-{fvg.fvg_high:.2f} "
+                  f"size=${fvg.gap_size:.2f} RR={self.rr}"),
+        )
 
     # ---- Paper trade simulation ----
     def _open_paper_trade(self, ts, symbol, side, entry, sl, tp, risk, fvg):
@@ -411,5 +425,13 @@ class FVGRetestStrategy:
 
     def compute_lots(self, equity, risk_dist, point=0.01, tick_value=1.0,
                      min_lot=0.01, max_lot=1.0):
-        # Paper strategy doesn't actually place via the engine — return 0
-        return 0.0 if self.paper else max(min_lot, round(equity * self.risk_pct / (risk_dist / point), 2))
+        # Paper strategy doesn't actually place via the engine — return 0.
+        # Live: identical formula to ORB_5MIN/PrevDayBreakoutStrategy —
+        # risk_cash / (risk in points * tick_value), clamped to [min_lot, max_lot].
+        if self.paper:
+            return 0.0
+        risk_cash = equity * self.risk_pct
+        loss_per_lot = (risk_dist / point) * tick_value
+        if loss_per_lot <= 0:
+            return 0.0
+        return min(max_lot, max(min_lot, round(risk_cash / loss_per_lot, 2)))
