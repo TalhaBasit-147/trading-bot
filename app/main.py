@@ -4,7 +4,7 @@ LIVE strategies (real orders, all fire independently):
   1. ORB_5MIN_LIVE           — first 5-min NY ORB, 15-min delay, RR=settings.RR_TARGET
   2. PREV_DAY_BREAKOUT       — previous day H/L breakout, RR=settings.RR_TARGET
   3. PREV_WEEK_BREAKOUT_LIVE — previous week H/L breakout, RR=1.5
-  4. FVG_RETEST              — bearish/bullish FVG retest, RR=1.5
+  4. FVG_RETEST              — bearish/bullish FVG retest, RR=2.5
 
 ENTRY TIME CUTOFF (PREV_DAY_BREAKOUT ONLY):
   - No NEW PREV_DAY_BREAKOUT entries at/after settings.PREV_DAY_NO_ENTRY_AFTER_UTC_HOUR
@@ -83,7 +83,7 @@ class Engine:
             ORB5MinStrategy(rr=settings.RR_TARGET, risk_pct=settings.RISK_PER_TRADE, paper=False),
             PrevDayBreakoutStrategy(rr=settings.RR_TARGET, risk_pct=settings.RISK_PER_TRADE),
             PrevWeekBreakoutStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE, paper=False),
-            FVGRetestStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE, paper=False),
+            FVGRetestStrategy(rr=2.5, risk_pct=settings.RISK_PER_TRADE, paper=False),
         ]
 
         self.paper_strategies = [
