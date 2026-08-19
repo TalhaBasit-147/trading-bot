@@ -24,7 +24,8 @@ Rules (sourced from Huddleston / ICT / Equiti / FundedTradingPlus):
 
 5. Invalidation: if price closes through the FVG extreme before retest, kill setup
 
-6. Session: London kill zone only (07:00-12:00 broker time)
+6. Session: London kill zone only (07:00-12:00 UTC — see the timezone note
+   below; this was mistakenly gated on unconverted broker time until fixed)
    - NY consistently underperformed in backtest
 
 7. One trade per day max. One FVG can only be traded once.
@@ -32,6 +33,15 @@ Rules (sourced from Huddleston / ICT / Equiti / FundedTradingPlus):
 Backtest on 73 days XAUUSD M1 (Feb-May 2026), AT RR=1.5 (now RR_TARGET=2.5,
 see rule 4 — these figures predate that change and haven't been re-run at 2.5):
    64 trades, 54.7% WR, +0.367R expectancy, PF 1.81
+
+TIMEZONE NOTE: M5Bar carries BOTH ts_broker (raw broker-server time) and
+ts_utc (converted via broker_time.to_utc). SESSION_START/SESSION_END below
+are UTC constants — every place that gates on time-of-day (FVG admission in
+on_bar(), retest checking in _update_active_fvgs()) must compare against
+ts_utc/formed_at_utc, never ts_broker. Getting this wrong previously shifted
+the actual traded window by the broker/UTC offset without changing any log
+output that would make it obvious (MT5 timestamps carry a UTC tzinfo label
+even though the underlying value is broker time — see broker_time.py).
 """
 from __future__ import annotations
 
@@ -72,11 +82,26 @@ PAPER_MODE = True
 PAPER_LOG_FILE = Path("logs/fvg_paper.jsonl")
 
 
+def _floor_to_5min(ts: datetime) -> datetime:
+    """Floor a UTC timestamp to the start of its 5-minute bucket."""
+    bucket = ts.replace(second=0, microsecond=0)
+    return bucket.replace(minute=(bucket.minute // 5) * 5)
+
+
 # ============== Data types ==============
 
 @dataclass
 class M5Bar:
-    ts: datetime
+    # Two DIFFERENT clocks, kept explicit so this bug class can't silently
+    # recur: ts_broker is the raw broker-server-time bucket boundary (what
+    # MT5 gives us); ts_utc is the same boundary converted to TRUE UTC via
+    # broker_time.to_utc(). ALL session/time-of-day gating must use ts_utc —
+    # SESSION_START/SESSION_END are UTC constants, and comparing them against
+    # ts_broker silently shifts the traded window by the broker/UTC offset
+    # (this was a real bug: the strategy traded UTC 04:00-09:00 instead of
+    # the intended 07:00-12:00 at the +3 broker offset).
+    ts_broker: datetime
+    ts_utc: datetime
     open: float
     high: float
     low: float
@@ -95,7 +120,7 @@ class M5Bar:
 @dataclass
 class FVG:
     """Represents a detected Fair Value Gap awaiting retest."""
-    formed_at: datetime
+    formed_at_utc: datetime   # TRUE UTC — see M5Bar.ts_utc
     side: str           # 'bullish' or 'bearish'
     fvg_low: float      # gap bottom edge
     fvg_high: float     # gap top edge
@@ -132,8 +157,8 @@ class FVGRetestStrategy:
         self.paper = paper
         self.strategy_name = "FVG_RETEST" + ("_PAPER" if paper else "_LIVE")
 
-        # M5 bar assembly from incoming M1 bars
-        self._m5_current: List[Bar] = []
+        # M5 bar assembly from incoming M1 bars: (raw M1 Bar, its TRUE UTC ts)
+        self._m5_current: List[tuple] = []
         self._m5_history: List[M5Bar] = []
 
         # Active FVGs awaiting retest
@@ -157,31 +182,37 @@ class FVGRetestStrategy:
         self._broker_offset = detect_broker_offset_hours(broker)
 
     # ---- M5 bar assembly ----
-    def _update_m5(self, m1: Bar) -> Optional[M5Bar]:
-        """Aggregate M1 bars into M5. Returns a completed M5 bar when one closes."""
-        if not self._m5_current:
-            self._m5_current.append(m1)
-            return None
-        first_ts = self._m5_current[0].ts
-        # M5 buckets align to clock 5-minute boundaries
-        first_bucket = first_ts.replace(second=0, microsecond=0)
-        first_bucket = first_bucket.replace(minute=(first_bucket.minute // 5) * 5)
-        this_bucket = m1.ts.replace(second=0, microsecond=0)
-        this_bucket = this_bucket.replace(minute=(this_bucket.minute // 5) * 5)
+    def _update_m5(self, m1: Bar, ts_utc: datetime) -> Optional[M5Bar]:
+        """Aggregate M1 bars into M5. Returns a completed M5 bar when one closes.
 
-        if this_bucket == first_bucket:
-            self._m5_current.append(m1)
+        ts_utc is the TRUE UTC time of this M1 bar (already converted by the
+        caller via broker_time.to_utc) — bucket boundaries are computed on
+        ts_utc, not the raw broker-time bar.ts. A whole/half-hour broker
+        offset is always a multiple of 5 minutes, so this groups the exact
+        same M1 bars a broker-time bucketing would; only the resulting LABEL
+        (and therefore every session-gate decision downstream) differs.
+        """
+        if not self._m5_current:
+            self._m5_current.append((m1, ts_utc))
+            return None
+        first_bar, first_ts_utc = self._m5_current[0]
+        first_bucket_utc = _floor_to_5min(first_ts_utc)
+        this_bucket_utc = _floor_to_5min(ts_utc)
+
+        if this_bucket_utc == first_bucket_utc:
+            self._m5_current.append((m1, ts_utc))
             return None
         # different bucket → close previous M5
-        bars = self._m5_current
+        bars = [b for b, _ in self._m5_current]
         m5 = M5Bar(
-            ts=first_bucket,
+            ts_broker=first_bar.ts,
+            ts_utc=first_bucket_utc,
             open=bars[0].open,
             high=max(b.high for b in bars),
             low=min(b.low for b in bars),
             close=bars[-1].close,
         )
-        self._m5_current = [m1]
+        self._m5_current = [(m1, ts_utc)]
         return m5
 
     # ---- ATR ----
@@ -207,7 +238,7 @@ class FVGRetestStrategy:
             gap = c2.low - c0.high
             if gap < MIN_GAP_SIZE: return None
             return FVG(
-                formed_at=c2.ts, side='bullish',
+                formed_at_utc=c2.ts_utc, side='bullish',
                 fvg_low=c0.high, fvg_high=c2.low,
                 sl_anchor=c0.low,
                 ce=(c0.high + c2.low) / 2,
@@ -217,7 +248,7 @@ class FVGRetestStrategy:
             gap = c0.low - c2.high
             if gap < MIN_GAP_SIZE: return None
             return FVG(
-                formed_at=c2.ts, side='bearish',
+                formed_at_utc=c2.ts_utc, side='bearish',
                 fvg_low=c2.high, fvg_high=c0.low,
                 sl_anchor=c0.high,
                 ce=(c2.high + c0.low) / 2,
@@ -226,9 +257,9 @@ class FVGRetestStrategy:
 
     # ---- main entry point ----
     def on_bar(self, bar: Bar, symbol: str = "XAUUSD") -> Optional[TradeSignal]:
-        utc_ts = to_utc(bar.ts, getattr(self, "_broker_offset", 3))
-        day = utc_ts.strftime("%Y-%m-%d")
-        t = utc_ts.time()
+        ts_utc = to_utc(bar.ts, getattr(self, "_broker_offset", 3))
+        day = ts_utc.strftime("%Y-%m-%d")
+        t = ts_utc.time()
 
         # New day reset
         if day != self._current_day:
@@ -237,8 +268,8 @@ class FVGRetestStrategy:
             self._active_fvgs.clear()  # FVGs don't carry across days (M5 session-bound)
             logger.info(f"[{self.strategy_name}] New day: {day}")
 
-        # Aggregate to M5
-        m5 = self._update_m5(bar)
+        # Aggregate to M5 (bucketed on TRUE UTC — see M5Bar/_update_m5)
+        m5 = self._update_m5(bar, ts_utc)
         if m5 is None:
             # Still check for paper SL/TP fills on current intra-bar prices
             self._check_paper_fills(bar)
@@ -255,11 +286,11 @@ class FVGRetestStrategy:
         # Detect new FVG on the most recent 3 bars
         new_fvg = self._detect_fvg()
         if new_fvg is not None:
-            # Only consider FVGs that form during the session
-            if SESSION_START <= new_fvg.formed_at.time() < SESSION_END:
+            # Only consider FVGs that form during the session (TRUE UTC)
+            if SESSION_START <= new_fvg.formed_at_utc.time() < SESSION_END:
                 self._active_fvgs.append(new_fvg)
                 logger.info(
-                    f"[{self.strategy_name}] NEW {new_fvg.side.upper()} FVG @ {new_fvg.formed_at} "
+                    f"[{self.strategy_name}] NEW {new_fvg.side.upper()} FVG @ {new_fvg.formed_at_utc} UTC "
                     f"gap={new_fvg.fvg_low:.2f}-{new_fvg.fvg_high:.2f} CE={new_fvg.ce:.2f} "
                     f"size=${new_fvg.gap_size:.2f}"
                 )
@@ -276,7 +307,7 @@ class FVGRetestStrategy:
         one signal per call (one trade per day)."""
         if self._traded_today:
             return None
-        if not (SESSION_START <= m5.ts.time() < SESSION_END):
+        if not (SESSION_START <= m5.ts_utc.time() < SESSION_END):
             return None
 
         for fvg in self._active_fvgs:
@@ -322,16 +353,17 @@ class FVGRetestStrategy:
         self._traded_today = True
 
         if self.paper:
-            self._open_paper_trade(m5.ts, symbol, side, entry, sl, tp, risk, fvg)
+            self._open_paper_trade(m5.ts_broker, symbol, side, entry, sl, tp, risk, fvg)
             return None
 
         # Live mode — return the signal so Engine._tick()/_execute() places the
         # real order through the exact same path as ORB_5MIN and
         # PREV_DAY_BREAKOUT (position sizing via compute_lots(), SL/TP via
         # place_market(), MAX_TRADES_PER_DAY / daily-loss / FTMO guards all
-        # live in the engine, not here).
+        # live in the engine, not here). TradeSignal.ts is broker time, same
+        # convention ORB_5MIN/PrevDayBreakoutStrategy use (they pass bar.ts).
         return TradeSignal(
-            ts=m5.ts, symbol=symbol, side=side,
+            ts=m5.ts_broker, symbol=symbol, side=side,
             entry=entry, sl=sl, tp=tp, risk_dist=risk,
             strategy=self.strategy_name,
             note=(f"FVG {fvg.side} CE={fvg.ce:.2f} "
