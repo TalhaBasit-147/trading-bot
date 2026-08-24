@@ -11,8 +11,19 @@ market reopens and the bot is restarted against it.
 """
 from datetime import datetime, timedelta, timezone
 
+import app.strategy.broker_time as broker_time
 from app.core.types import Bar, Side
 from app.strategy.fvg_retest import FVGRetestStrategy, RR_TARGET, SESSION_START
+
+
+def setup_function(_fn):
+    # FVGRetestStrategy's admission/retest gates now check
+    # broker_time.has_confirmed_broker_offset() (fail-closed guard). Most
+    # tests here are exercising FVG logic, not that guard, so default to a
+    # confirmed offset; the fail-closed-specific tests below override this
+    # explicitly. Without this, tests would silently depend on whatever
+    # _last_good_offset another test file happened to leave behind.
+    broker_time._last_good_offset = 3.0
 
 
 def _make_m1_bars(utc_base=None, broker_offset=0.0):
@@ -185,11 +196,18 @@ def test_session_gate_admits_when_true_utc_is_in_session_even_if_broker_time_is_
     assert len(non_none) == 1, "FVG must be admitted and fire when its true UTC formation time is in session"
 
 
-def test_session_gate_behaves_sanely_with_unconfirmed_fallback_offset():
-    """When _broker_offset was never set at all (the getattr(..., 3) default
-    path -- what happens if set_broker() hasn't run / offset detection never
-    confirmed anything), the fix must not crash and must still gate
-    consistently on whatever offset it ends up using."""
+# ── Fail-closed on unconfirmed broker offset ─────────────────────────────
+# FVG_RETEST's session window is core, backtested strategy logic (unlike a
+# defensive add-on cutoff), so unlike PREV_DAY_BREAKOUT's fail-OPEN gate,
+# this strategy must fail CLOSED when the offset has never been confirmed
+# from live data -- trading on a guess means trading an unvalidated hour,
+# which is the timezone bug coming back another way.
+
+def test_fails_closed_when_offset_never_confirmed():
+    """_broker_offset unset at all (the getattr(..., 3) default path -- what
+    happens if set_broker() hasn't run / offset detection never confirmed
+    anything) must not crash, but must also NOT admit or fire any FVG."""
+    broker_time._last_good_offset = None  # nothing ever confirmed
     strat = FVGRetestStrategy(rr=RR_TARGET, risk_pct=0.02, paper=False)
     assert not hasattr(strat, "_broker_offset")  # simulates the unconfirmed-fallback path
 
@@ -198,5 +216,25 @@ def test_session_gate_behaves_sanely_with_unconfirmed_fallback_offset():
     signals = [strat.on_bar(b, "XAUUSD")
                for b in _make_m1_bars(utc_base=utc_base, broker_offset=3.0)]
 
-    non_none = [s for s in signals if s is not None]
-    assert len(non_none) == 1  # doesn't crash, and gates consistently with the fallback
+    assert all(s is None for s in signals), "must not fire while unconfirmed"
+    assert strat._active_fvgs == [], "must not even admit the FVG while unconfirmed"
+
+
+def test_same_scenario_fires_once_confirmed_but_not_before():
+    """Direct A/B: identical bar sequence and offset, differing only in
+    confirmation state -- confirms the guard is the deciding factor, not
+    something else about the scenario."""
+    utc_base = datetime(2026, 6, 1, 7, 0)
+    bars = _make_m1_bars(utc_base=utc_base, broker_offset=3.0)
+
+    broker_time._last_good_offset = None
+    strat_unconfirmed = FVGRetestStrategy(rr=RR_TARGET, risk_pct=0.02, paper=False)
+    strat_unconfirmed._broker_offset = 3.0
+    signals_unconfirmed = [strat_unconfirmed.on_bar(b, "XAUUSD") for b in bars]
+    assert all(s is None for s in signals_unconfirmed)
+
+    broker_time._last_good_offset = 3.0
+    strat_confirmed = FVGRetestStrategy(rr=RR_TARGET, risk_pct=0.02, paper=False)
+    strat_confirmed._broker_offset = 3.0
+    signals_confirmed = [strat_confirmed.on_bar(b, "XAUUSD") for b in bars]
+    assert len([s for s in signals_confirmed if s is not None]) == 1

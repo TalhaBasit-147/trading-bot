@@ -42,6 +42,16 @@ ts_utc/formed_at_utc, never ts_broker. Getting this wrong previously shifted
 the actual traded window by the broker/UTC offset without changing any log
 output that would make it obvious (MT5 timestamps carry a UTC tzinfo label
 even though the underlying value is broker time — see broker_time.py).
+
+FAIL-CLOSED ON UNCONFIRMED OFFSET: FVG admission (on_bar()) and retest
+checking (_update_active_fvgs()) both refuse to act unless
+broker_time.has_confirmed_broker_offset() is True. Unlike a defensive add-on
+gate (e.g. PREV_DAY_BREAKOUT's entry-time cutoff, which fails OPEN when
+unconfirmed), the session window IS this strategy's core, backtested logic —
+trading on an unconfirmed/guessed offset means trading an unvalidated hour,
+which is the timezone bug above coming back another way. A skipped FVG is
+not retried once confirmed; that's the accepted tradeoff for never silently
+mis-gating.
 """
 from __future__ import annotations
 
@@ -54,7 +64,7 @@ from typing import List, Optional
 from loguru import logger
 
 from app.core.types import Bar, Side
-from app.strategy.broker_time import detect_broker_offset_hours, to_utc
+from app.strategy.broker_time import detect_broker_offset_hours, has_confirmed_broker_offset, to_utc
 
 
 # ============== ICT FVG configuration ==============
@@ -288,12 +298,26 @@ class FVGRetestStrategy:
         if new_fvg is not None:
             # Only consider FVGs that form during the session (TRUE UTC)
             if SESSION_START <= new_fvg.formed_at_utc.time() < SESSION_END:
-                self._active_fvgs.append(new_fvg)
-                logger.info(
-                    f"[{self.strategy_name}] NEW {new_fvg.side.upper()} FVG @ {new_fvg.formed_at_utc} UTC "
-                    f"gap={new_fvg.fvg_low:.2f}-{new_fvg.fvg_high:.2f} CE={new_fvg.ce:.2f} "
-                    f"size=${new_fvg.gap_size:.2f}"
-                )
+                if not has_confirmed_broker_offset():
+                    # Fail CLOSED: the session window is this strategy's core
+                    # logic (unlike a defensive add-on cutoff), so an
+                    # unconfirmed offset means we can't trust this admission
+                    # decision at all -- skip it rather than risk trading an
+                    # unvalidated hour, which is exactly the bug this session
+                    # fix was for, coming back another way. This FVG is lost
+                    # (not retried later), which is the accepted tradeoff.
+                    logger.warning(
+                        f"[{self.strategy_name}] FVG detected @ {new_fvg.formed_at_utc} UTC "
+                        f"but broker offset is unconfirmed (fallback only) — "
+                        f"skipping admission, failing closed"
+                    )
+                else:
+                    self._active_fvgs.append(new_fvg)
+                    logger.info(
+                        f"[{self.strategy_name}] NEW {new_fvg.side.upper()} FVG @ {new_fvg.formed_at_utc} UTC "
+                        f"gap={new_fvg.fvg_low:.2f}-{new_fvg.fvg_high:.2f} CE={new_fvg.ce:.2f} "
+                        f"size=${new_fvg.gap_size:.2f}"
+                    )
 
         # Check paper position fills (simulated SL/TP)
         self._check_paper_fills(bar)
@@ -306,6 +330,13 @@ class FVGRetestStrategy:
         """For each active FVG, check invalidation or retest. Emits at most
         one signal per call (one trade per day)."""
         if self._traded_today:
+            return None
+        if not has_confirmed_broker_offset():
+            # Defense-in-depth: an FVG can only be in _active_fvgs if it was
+            # admitted while confirmed (see on_bar()), and confirmation never
+            # reverts to False once set for this process -- so this branch
+            # shouldn't currently be reachable in practice. Kept explicit so
+            # it fails closed immediately if that invariant ever changes.
             return None
         if not (SESSION_START <= m5.ts_utc.time() < SESSION_END):
             return None
