@@ -26,7 +26,7 @@ def setup_function(_fn):
     broker_time._last_good_offset = 3.0
 
 
-def _make_m1_bars(utc_base=None, broker_offset=0.0):
+def _make_m1_bars(utc_base=None, broker_offset=0.0, c2_low=4008.0):
     """One M1 bar per intended M5 candle (single-bar buckets), 5 min apart,
     starting at utc_base (TRUE UTC). Bar.ts (what the "broker" hands the
     strategy) is shifted forward by broker_offset hours, matching how MT5
@@ -40,6 +40,9 @@ def _make_m1_bars(utc_base=None, broker_offset=0.0):
       15   : c1 -- impulsive bullish candle (body >> ATR)
       16   : c2 -- gaps away from c0 -> bullish FVG forms here
       17   : retest -- price dips back into the FVG and tags CE
+
+    c2_low controls the gap size (gap = c2_low - c0.high(4000.5)); defaults
+    to the original $7.50 gap used by most tests here.
     """
     if utc_base is None:
         utc_base = datetime(2026, 6, 1, 7, 0, tzinfo=timezone.utc).replace(tzinfo=None)
@@ -54,11 +57,13 @@ def _make_m1_bars(utc_base=None, broker_offset=0.0):
     candles.append((4000.0, 4000.5, 3999.8, 4000.2))
     # 15: c1 -- impulsive bullish (body=9.8, far above the ~$1 ATR baseline)
     candles.append((4000.2, 4010.2, 4000.1, 4010.0))
-    # 16: c2 -- gaps above c0.high(4000.5): low=4008 > 4000.5
-    candles.append((4010.0, 4014.0, 4008.0, 4012.0))
-    # 17: retest -- dips to tag CE (computed below as 4004.25), stays above
-    #     fvg_low(4000.5) so it doesn't invalidate first
-    candles.append((4012.0, 4006.0, 4003.0, 4005.0))
+    # 16: c2 -- gaps above c0.high(4000.5): low=c2_low
+    candles.append((4010.0, 4014.0, c2_low, 4012.0))
+    # 17: retest -- dips back toward the gap. Uses the CE midpoint of
+    #     [4000.5, c2_low] as the low so it always tags CE regardless of gap
+    #     size, while staying above fvg_low(4000.5) so it doesn't invalidate.
+    ce = (4000.5 + c2_low) / 2
+    candles.append((c2_low + 4.0, c2_low + 6.0, ce - 1.0, ce + 1.0))
 
     bars = [
         Bar(ts=base + timedelta(minutes=5 * i), open=o, high=h, low=l, close=c, volume=1.0)
@@ -238,3 +243,36 @@ def test_same_scenario_fires_once_confirmed_but_not_before():
     strat_confirmed._broker_offset = 3.0
     signals_confirmed = [strat_confirmed.on_bar(b, "XAUUSD") for b in bars]
     assert len([s for s in signals_confirmed if s is not None]) == 1
+
+
+# ── MIN_GAP_SIZE threshold (Issue 1: real trade had a $1.43 gap, $0.75 slippage) ──
+
+def test_gap_matching_real_undersized_trade_is_now_rejected():
+    """Reproduces the shape of the real Aug 26 trade: a ~$1.43 gap. Must not
+    form an FVG at all under the new $2.5 threshold (old threshold was $0.5,
+    which would have admitted this)."""
+    strat = FVGRetestStrategy(rr=RR_TARGET, risk_pct=0.02, paper=False)
+    strat._broker_offset = 0
+
+    # c0.high=4000.5, so c2_low=4001.93 -> gap=1.43
+    signals = [strat.on_bar(b, "XAUUSD") for b in _make_m1_bars(c2_low=4001.93)]
+
+    assert all(s is None for s in signals)
+    assert strat._active_fvgs == [], "a $1.43 gap must not be admitted at MIN_GAP_SIZE=2.5"
+
+
+def test_gap_just_below_threshold_is_rejected_gap_at_threshold_admits():
+    """Boundary check: gap < 2.5 rejected, gap >= 2.5 admitted (the check is
+    `if gap < MIN_GAP_SIZE: return None`, so exactly 2.5 must pass)."""
+    strat_below = FVGRetestStrategy(rr=RR_TARGET, risk_pct=0.02, paper=False)
+    strat_below._broker_offset = 0
+    signals_below = [strat_below.on_bar(b, "XAUUSD")
+                      for b in _make_m1_bars(c2_low=4000.5 + 2.4)]
+    assert strat_below._active_fvgs == []
+
+    strat_at = FVGRetestStrategy(rr=RR_TARGET, risk_pct=0.02, paper=False)
+    strat_at._broker_offset = 0
+    signals_at = [strat_at.on_bar(b, "XAUUSD")
+                  for b in _make_m1_bars(c2_low=4000.5 + 2.5)]
+    non_none = [s for s in signals_at if s is not None]
+    assert len(non_none) == 1, "a gap exactly at MIN_GAP_SIZE must be admitted"
