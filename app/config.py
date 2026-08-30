@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     # tick, or broker data unavailable). IC Markets is UTC+3 in summer / +2 in
     # winter (server DST) — this is a last-resort guess, not a hardcoded truth.
     BROKER_OFFSET_FALLBACK_HOURS: float = 3.0
+    # PREV_DAY_BREAKOUT only: only take a breakout if its direction agrees
+    # with the D1 EMA50 regime (prev day's D1 close vs D1 EMA50). Toggle off
+    # to trade every fresh cross regardless of daily trend, with no code change.
+    PREV_DAY_TREND_FILTER_ENABLED: bool = True
 
     # MT5
     MT5_LOGIN: int | None = None
