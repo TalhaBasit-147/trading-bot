@@ -79,7 +79,12 @@ CLOSE_DEADLINE = time(18, 0)  # force close any open trades at EOD (UTC)
 M5_BARS_PER_M1 = 5
 IMPULSE_ATR_MULT = 1.0   # middle candle body must be >= this * ATR(14)
 ATR_PERIOD = 14
-MIN_GAP_SIZE = 0.5       # minimum dollar size of the FVG to consider
+# Minimum dollar size of the FVG to consider. Raised from 0.5 to 2.5: a live
+# trade on a $1.43 gap took $0.75 of slippage on re-anchor (>50% of the gap)
+# -- since SL anchors to the origin-candle extreme, a thin gap means the
+# re-anchored entry sits dangerously close to SL before the trade even moves.
+# $2.00+ was the threshold that showed edge in backtesting.
+MIN_GAP_SIZE = 2.5
 
 # Entry / risk
 SL_BUFFER = 0.5          # dollars beyond FVG extreme
