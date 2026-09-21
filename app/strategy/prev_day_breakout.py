@@ -28,6 +28,7 @@ from typing import Optional
 
 from loguru import logger
 
+from app.config import settings
 from app.core.types import Bar, Side
 from app.strategy.broker_time import detect_broker_offset_hours, to_utc
 
@@ -38,6 +39,13 @@ class PrevDayLevels:
     high: float
     low: float
     range_size: float
+
+
+@dataclass
+class DailyTrend:
+    """D1 regime as of the previous COMPLETE trading day (no lookahead)."""
+    prev_close: float
+    ema50: float
 
 
 @dataclass
@@ -73,6 +81,11 @@ MAX_OVERSHOOT = 3.0  # dollars past the level
 
 CACHE_FILE = Path("data/prev_day_levels.json")
 
+# Daily trend filter (D1 EMA50 regime vs breakout direction)
+DAILY_TREND_D1_BARS = 60      # bars requested from MT5 (includes the current, incomplete day)
+DAILY_TREND_EMA_PERIOD = 50
+DAILY_TREND_MIN_COMPLETE_BARS = 51  # below this, fail open rather than block
+
 
 class PrevDayBreakoutStrategy:
     def __init__(self, rr: float = RR_TARGET, risk_pct: float = 0.02, broker=None):
@@ -80,6 +93,7 @@ class PrevDayBreakoutStrategy:
         self.risk_pct = risk_pct
         self.strategy_name = "PREV_DAY_BREAKOUT"
         self.broker = broker
+        self._trend_regime: Optional[DailyTrend] = None
         self._current_day = ""
         self._traded_today = False
         self._prev_levels: Optional[PrevDayLevels] = None
@@ -105,6 +119,72 @@ class PrevDayBreakoutStrategy:
             )
         else:
             logger.warning(f"[{self.strategy_name}] No prev day levels available for {new_day}")
+
+        # Refreshed ONLY here, on new-day rollover — never re-fetched per tick.
+        if settings.PREV_DAY_TREND_FILTER_ENABLED:
+            self._trend_regime = self._fetch_daily_trend_regime(symbol)
+            if self._trend_regime is not None:
+                regime = ("BULLISH" if self._trend_regime.prev_close > self._trend_regime.ema50
+                          else "BEARISH" if self._trend_regime.prev_close < self._trend_regime.ema50
+                          else "FLAT")
+                logger.info(
+                    f"[{self.strategy_name}] [TREND_FILTER] D1 regime={regime} "
+                    f"prev_close={self._trend_regime.prev_close:.2f} "
+                    f"ema50={self._trend_regime.ema50:.2f}"
+                )
+        else:
+            self._trend_regime = None
+
+    def _fetch_daily_trend_regime(self, symbol: str) -> Optional[DailyTrend]:
+        """D1 close vs EMA50 as of the previous COMPLETE trading day.
+
+        Fail-open contract: on any fetch failure or insufficient history,
+        return None and log a WARNING. Callers must treat None as "don't
+        apply the filter today", never as a reason to block trading.
+        """
+        try:
+            import MetaTrader5 as mt5
+            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, 0, DAILY_TREND_D1_BARS)
+            if rates is None or len(rates) == 0:
+                logger.warning(
+                    f"[{self.strategy_name}] [TREND_FILTER] D1 fetch returned no bars "
+                    f"— failing open (filter not applied today)"
+                )
+                return None
+            # copy_rates_from_pos(..., 0, ...) includes the CURRENT (possibly
+            # incomplete) day at the end — drop it. No lookahead: everything
+            # used below is a fully closed D1 bar.
+            completed = rates[:-1]
+            if len(completed) < DAILY_TREND_MIN_COMPLETE_BARS:
+                logger.warning(
+                    f"[{self.strategy_name}] [TREND_FILTER] Only {len(completed)} complete "
+                    f"D1 bars available (<{DAILY_TREND_MIN_COMPLETE_BARS} needed) "
+                    f"— failing open (filter not applied today)"
+                )
+                return None
+            closes = [float(r['close']) for r in completed]
+            prev_close = closes[-1]
+            ema50 = self._ema(closes, DAILY_TREND_EMA_PERIOD)
+            return DailyTrend(prev_close=prev_close, ema50=ema50)
+        except Exception as e:
+            logger.warning(
+                f"[{self.strategy_name}] [TREND_FILTER] D1 fetch failed: {e} "
+                f"— failing open (filter not applied today)"
+            )
+            return None
+
+    @staticmethod
+    def _ema(closes: list, period: int) -> float:
+        """Standard EMA: seed with the SMA of the first `period` values, then
+        apply the exponential multiplier through the rest. Returns the final
+        (most recent) value."""
+        if len(closes) < period:
+            return sum(closes) / len(closes)
+        multiplier = 2.0 / (period + 1)
+        value = sum(closes[:period]) / period
+        for price in closes[period:]:
+            value = (price - value) * multiplier + value
+        return value
 
     def _fetch_previous_day_levels(self, symbol: str, today: str) -> Optional[PrevDayLevels]:
         if self.broker is None:
@@ -225,6 +305,27 @@ class PrevDayBreakoutStrategy:
 
         if side is None:
             return None
+
+        # Daily EMA50 trend filter: only take the breakout if its direction
+        # agrees with the D1 regime as of the previous complete day. Skips
+        # silently (same as the overshoot guard above) -- doesn't consume
+        # _traded_today, so a later same-day breakout in the OTHER direction
+        # can still fire if it agrees with the (fixed-for-the-day) regime.
+        if settings.PREV_DAY_TREND_FILTER_ENABLED and self._trend_regime is not None:
+            prev_close = self._trend_regime.prev_close
+            ema50 = self._trend_regime.ema50
+            if side == Side.BUY and not (prev_close > ema50):
+                logger.info(
+                    f"[TREND_FILTER] Skipping PREV_DAY BUY — price below EMA50 "
+                    f"(prev_close={prev_close:.2f}, ema50={ema50:.2f})"
+                )
+                return None
+            if side == Side.SELL and not (prev_close < ema50):
+                logger.info(
+                    f"[TREND_FILTER] Skipping PREV_DAY SELL — price above EMA50 "
+                    f"(prev_close={prev_close:.2f}, ema50={ema50:.2f})"
+                )
+                return None
 
         risk_dist = abs(entry - sl)
         tp = entry + risk_dist * self.rr if side == Side.BUY else entry - risk_dist * self.rr
