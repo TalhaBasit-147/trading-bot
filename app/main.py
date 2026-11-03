@@ -4,12 +4,17 @@ LIVE strategies (real orders, all fire independently):
   1. ORB_5MIN_LIVE           — first 5-min NY ORB, 15-min delay, RR=settings.RR_TARGET
   2. PREV_DAY_BREAKOUT       — previous day H/L breakout, RR=settings.RR_TARGET
   3. PREV_WEEK_BREAKOUT_LIVE — previous week H/L breakout, RR=1.5
-  4. FVG_RETEST              — bearish/bullish FVG retest, RR=2.5
+
+  FVG_RETEST removed 2026-09-22: 12-month backtest showed it claimed 56.6% of
+  daily trade slots (MAX_TRADES_PER_DAY=1) ahead of PREV_WEEK_BREAKOUT, which
+  is a stronger strategy when not starved (+0.333 avg R freed vs -0.318
+  starved). Removing FVG flipped combined 12mo return -1.94% -> +5.52% and
+  cut max drawdown 43.2% -> 28.2%. See data/backtest_12m_report.txt.
 
 ENTRY TIME CUTOFF (PREV_DAY_BREAKOUT ONLY):
   - No NEW PREV_DAY_BREAKOUT entries at/after settings.PREV_DAY_NO_ENTRY_AFTER_UTC_HOUR
-    (UTC, same clock the strategies use internally). ORB_5MIN, PREV_WEEK_BREAKOUT,
-    and FVG_RETEST are NOT time-gated — ORB in particular legitimately enters in
+    (UTC, same clock the strategies use internally). ORB_5MIN and PREV_WEEK_BREAKOUT
+    are NOT time-gated — ORB in particular legitimately enters in
     the afternoon UTC window. Already-open trades run to their SL/TP untouched.
 
 DAILY LOSS GATE:
@@ -42,7 +47,6 @@ from app.monitoring.logging_setup import setup_logging
 from app.notify.telegram import Telegram
 from app.strategy.broker_time import detect_broker_offset_hours, has_confirmed_broker_offset, to_utc
 from app.strategy.prev_day_breakout import PrevDayBreakoutStrategy
-from app.strategy.fvg_retest import FVGRetestStrategy
 from app.strategy.prev_week_breakout import PrevWeekBreakoutStrategy
 from app.strategy.orb_5min import ORB5MinStrategy
 from app.strategy.risk import RiskManager
@@ -83,7 +87,6 @@ class Engine:
             ORB5MinStrategy(rr=settings.RR_TARGET, risk_pct=settings.RISK_PER_TRADE, paper=False),
             PrevDayBreakoutStrategy(rr=settings.RR_TARGET, risk_pct=settings.RISK_PER_TRADE),
             PrevWeekBreakoutStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE, paper=False),
-            FVGRetestStrategy(rr=2.5, risk_pct=settings.RISK_PER_TRADE, paper=False),
         ]
 
         self.paper_strategies = [
