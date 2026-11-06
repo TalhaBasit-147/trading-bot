@@ -1,7 +1,7 @@
 """Main engine — multi-strategy with independent firing + daily loss gate.
 
 LIVE strategies (real orders, all fire independently):
-  1. ORB_5MIN_LIVE           — first 5-min NY ORB, 15-min delay, RR=settings.RR_TARGET
+  1. (ORB_5MIN now runs as PAPER only — see paper_strategies; it places no real orders)
   2. PREV_DAY_BREAKOUT       — previous day H/L breakout, RR=settings.RR_TARGET
   3. PREV_WEEK_BREAKOUT_LIVE — previous week H/L breakout, RR=1.5
 
@@ -84,13 +84,19 @@ class Engine:
         # ── Strategy registry ──────────────────────────────────────────────
         # All live strategies fire independently. Daily loss gate controls flow.
         self.live_strategies = [
-            ORB5MinStrategy(rr=settings.RR_TARGET, risk_pct=settings.RISK_PER_TRADE, paper=False),
             PrevDayBreakoutStrategy(rr=settings.RR_TARGET, risk_pct=settings.RISK_PER_TRADE),
             PrevWeekBreakoutStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE, paper=False),
         ]
 
         self.paper_strategies = [
             TWKMomentumStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE, paper=True),
+            # ORB_5MIN moved from live to paper. A 3-year DST-aware engine backtest
+            # (Feb 2024 - Sep 2026) had it at -0.077R/trade over 322 trades inside the
+            # live mix, and the book without it did better (+22R vs -5R). That
+            # difference is suggestive, not statistically conclusive, so it keeps
+            # running here as paper (logs/orb5min_paper.jsonl) for monitoring instead
+            # of being deleted.
+            ORB5MinStrategy(rr=settings.RR_TARGET, risk_pct=settings.RISK_PER_TRADE, paper=True),
         ]
 
         # Inject broker into strategies that need MT5 history
