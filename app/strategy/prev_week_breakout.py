@@ -30,6 +30,7 @@ from typing import Optional
 
 from loguru import logger
 
+from app.config import settings
 from app.core.types import Bar, Side
 from app.strategy.broker_time import detect_broker_offset_hours, to_utc
 
@@ -79,12 +80,23 @@ class TradeSignal:
 
 class PrevWeekBreakoutStrategy:
     def __init__(self, rr: float = RR_TARGET, risk_pct: float = 0.02,
-                 paper: bool = PAPER_MODE, broker=None):
+                 paper: bool = PAPER_MODE, broker=None,
+                 symbol: Optional[str] = None, price_scale: float = 1.0):
         self.rr         = rr
         self.risk_pct   = risk_pct
         self.paper      = paper
         self.broker     = broker
-        self.strategy_name = "PREV_WEEK_BREAKOUT" + ("_PAPER" if paper else "_LIVE")
+        # Multi-symbol: primary symbol keeps the original name/cache; others get their own.
+        self.symbol     = (symbol or settings.PRIMARY_SYMBOL).upper()
+        suffix          = "" if self.symbol == settings.PRIMARY_SYMBOL.upper() else f"_{self.symbol}"
+        self.strategy_name = "PREV_WEEK_BREAKOUT" + ("_PAPER" if paper else "_LIVE") + suffix
+        self.cache_file = CACHE_FILE if not suffix else CACHE_FILE.with_name(f"{CACHE_FILE.stem}{suffix}{CACHE_FILE.suffix}")
+        # Gold-dollar constants scaled to this symbol's price units (1.0 = gold, unchanged).
+        self.price_scale   = float(price_scale)
+        self.max_risk_dist = MAX_RISK_DIST * self.price_scale
+        self.min_risk_dist = MIN_RISK_DIST * self.price_scale
+        self.sl_buffer     = SL_BUFFER * self.price_scale
+        self.max_overshoot = MAX_OVERSHOOT * self.price_scale
 
         self._current_day   = ""
         self._current_week  = ""
@@ -104,7 +116,7 @@ class PrevWeekBreakoutStrategy:
 
     def set_broker(self, broker) -> None:
         self.broker = broker
-        self._broker_offset = detect_broker_offset_hours(broker)
+        self._broker_offset = detect_broker_offset_hours(broker, self.symbol)
 
     # ── Weekly level fetching ──────────────────────────────────────────────
 
@@ -164,8 +176,8 @@ class PrevWeekBreakoutStrategy:
 
     def _save_cache(self, lvl: WeekLevels) -> None:
         try:
-            CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CACHE_FILE.write_text(json.dumps({
+            self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+            self.cache_file.write_text(json.dumps({
                 "week_label": lvl.week_label, "high": lvl.high,
                 "low": lvl.low, "range_size": lvl.range_size,
             }, indent=2))
@@ -174,9 +186,9 @@ class PrevWeekBreakoutStrategy:
 
     def _load_cache(self) -> Optional[WeekLevels]:
         try:
-            if not CACHE_FILE.exists():
+            if not self.cache_file.exists():
                 return None
-            return WeekLevels(**json.loads(CACHE_FILE.read_text()))
+            return WeekLevels(**json.loads(self.cache_file.read_text()))
         except Exception as e:
             logger.warning(f"cache load failed: {e}")
             return None
@@ -245,9 +257,9 @@ class PrevWeekBreakoutStrategy:
 
         # Risk sizing
         pw_range = self._levels.range_size
-        risk = min(pw_range * RANGE_FRACTION, MAX_RISK_DIST)
-        if risk < MIN_RISK_DIST:
-            risk = MIN_RISK_DIST
+        risk = min(pw_range * RANGE_FRACTION, self.max_risk_dist)
+        if risk < self.min_risk_dist:
+            risk = self.min_risk_dist
 
         # Fresh cross detection
         crossed_up   = self._was_inside and bar.high > pwh
@@ -260,22 +272,22 @@ class PrevWeekBreakoutStrategy:
 
         if crossed_up:
             overshoot = bar.close - pwh
-            if overshoot > MAX_OVERSHOOT:
+            if overshoot > self.max_overshoot:
                 logger.info(f"[{self.strategy_name}] BUY cross but "
-                            f"overshoot ${overshoot:.1f} > ${MAX_OVERSHOOT} — skip")
+                            f"overshoot ${overshoot:.1f} > ${self.max_overshoot} — skip")
                 return None
             side  = Side.BUY
-            entry = pwh + SL_BUFFER
+            entry = pwh + self.sl_buffer
             sl    = entry - risk
 
         elif crossed_down:
             overshoot = pwl - bar.close
-            if overshoot > MAX_OVERSHOOT:
+            if overshoot > self.max_overshoot:
                 logger.info(f"[{self.strategy_name}] SELL cross but "
-                            f"overshoot ${overshoot:.1f} > ${MAX_OVERSHOOT} — skip")
+                            f"overshoot ${overshoot:.1f} > ${self.max_overshoot} — skip")
                 return None
             side  = Side.SELL
-            entry = pwl - SL_BUFFER
+            entry = pwl - self.sl_buffer
             sl    = entry + risk
 
         if side is None:

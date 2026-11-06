@@ -88,11 +88,16 @@ def _plausible(offset: float) -> bool:
     return _MIN_PLAUSIBLE_OFFSET_HOURS <= offset <= _MAX_PLAUSIBLE_OFFSET_HOURS
 
 
-def detect_broker_offset_hours(broker) -> float:
+def detect_broker_offset_hours(broker, symbol: str = "XAUUSD") -> float:
     """Compute broker server offset from UTC, in hours (whole or half-hour).
 
     See module docstring for the full preference order and rejection rules.
     Never raises; always returns a usable, sane number.
+
+    `symbol` is whose live tick / last bar is read. Every symbol shares the
+    broker's one server clock, but a 24/7 symbol (e.g. BTCUSD) still has a
+    fresh tick at weekends when gold's is stale, so each strategy asks with
+    its own symbol.
     """
     global _last_good_offset
     fallback = _last_good_offset if _last_good_offset is not None else settings.BROKER_OFFSET_FALLBACK_HOURS
@@ -101,7 +106,7 @@ def detect_broker_offset_hours(broker) -> float:
     # 1) Live tick — current even when the market has just gone quiet, and
     #    itself stale (caught below) only when the market is genuinely closed.
     try:
-        tick = broker.tick("XAUUSD")
+        tick = broker.tick(symbol)
         tick_ts = _naive(tick["time"])
         raw_diff = (tick_ts - utc_now).total_seconds() / 3600.0
         candidate = _round_to_half_hour(raw_diff)
@@ -118,7 +123,7 @@ def detect_broker_offset_hours(broker) -> float:
     # 2) Last M1 bar — only trusted if fresh relative to the best offset we
     #    currently know (last confirmed, or the configured default).
     try:
-        bars = broker.get_bars("XAUUSD", "M1", 2)
+        bars = broker.get_bars(symbol, "M1", 2)
         if bars:
             bar_ts = _naive(bars[-1].ts)
             implied_utc = bar_ts - timedelta(hours=fallback)
