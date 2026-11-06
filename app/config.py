@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     # symbols
     SYMBOLS: str = "XAUUSD,EURUSD,GBPUSD,USDJPY,GBPJPY,AUDUSD"
     PRIMARY_SYMBOL: str = "XAUUSD"
+    # Symbols the engine trades LIVE, comma-separated (e.g. "XAUUSD,BTCUSD").
+    # Empty = PRIMARY_SYMBOL only, i.e. the original single-symbol behaviour.
+    # Deliberately a new key: the legacy SYMBOLS above defaults to six symbols
+    # and must never silently become the live trading list.
+    # Per-symbol keys (see app/symbols.py): <SYM>_PRICE_SCALE (required for any
+    # non-primary symbol), <SYM>_STRATEGIES, <SYM>_RISK_PER_TRADE,
+    # <SYM>_RR_PREV_DAY, <SYM>_RR_PREV_WEEK, <SYM>_MAX_TRADES_PER_DAY.
+    TRADE_SYMBOLS: str = ""
 
     # timeframes
     BIAS_TIMEFRAME: str = "M15"

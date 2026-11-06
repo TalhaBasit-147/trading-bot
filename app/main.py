@@ -23,6 +23,17 @@ DAILY LOSS GATE:
   - After a LOSS: one recovery trade allowed
   - If recovery also loses: blocked until next day
   - Any WIN resets the recovery slot
+
+MULTI-SYMBOL (TRADE_SYMBOLS, see app/symbols.py):
+  - Every symbol in TRADE_SYMBOLS is watched on its own M1 chart with its own
+    copy of each live strategy; whichever symbol's setup triggers is traded.
+  - Per symbol: the daily loss gate above, MAX_TRADES_PER_DAY (its own
+    <SYM>_MAX_TRADES_PER_DAY) and MAX_CONCURRENT_TRADES open positions.
+  - Account-wide (shared): daily/weekly loss caps, consecutive-loss cool-down,
+    kill switch, FTMO guard.
+  - Paper strategies (ORB, TWK) run on PRIMARY_SYMBOL only.
+  - With TRADE_SYMBOLS unset, only PRIMARY_SYMBOL trades and every decision
+    is made exactly as in the single-symbol engine.
 """
 from __future__ import annotations
 
@@ -30,6 +41,7 @@ import os
 import signal
 import threading
 import time as time_mod
+from dataclasses import dataclass
 from datetime import datetime, time, timezone
 from typing import Dict, List, Optional
 from app.strategy.twk_momentum import TWKMomentumStrategy
@@ -51,9 +63,20 @@ from app.strategy.prev_week_breakout import PrevWeekBreakoutStrategy
 from app.strategy.orb_5min import ORB5MinStrategy
 from app.strategy.risk import RiskManager
 from app.strategy.ftmo_guard import FTMOGuard, FTMOConfig
+from app.symbols import load_symbol_configs
 
 
 KILL_FILE = "./KILL"
+
+
+@dataclass
+class _SymbolState:
+    """Per-symbol engine state (each symbol has its own chart, day and gate)."""
+    last_bar_ts: Optional[datetime] = None
+    current_day: str = ""
+    last_outcome_today: Optional[str] = None   # 'WIN' | 'LOSS' | None
+    recovery_trade_taken: bool = False         # one-shot after a loss
+    trades_today: int = 0
 
 
 def _make_broker() -> Broker:
@@ -81,12 +104,26 @@ class Engine:
         self.broker   = broker
         self.notifier = notifier
 
-        # ── Strategy registry ──────────────────────────────────────────────
-        # All live strategies fire independently. Daily loss gate controls flow.
-        self.live_strategies = [
-            PrevDayBreakoutStrategy(rr=settings.RR_TARGET, risk_pct=settings.RISK_PER_TRADE),
-            PrevWeekBreakoutStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE, paper=False),
-        ]
+        # ── Symbols + strategy registry ────────────────────────────────────
+        # One copy of each live strategy per traded symbol (TRADE_SYMBOLS).
+        # The primary symbol's defaults are the global settings, so with
+        # TRADE_SYMBOLS unset this is exactly the original gold-only registry:
+        # PREV_DAY (rr=RR_TARGET) then PREV_WEEK (rr=1.5), in that priority.
+        self.symbol_cfgs = load_symbol_configs()
+        self._cfg = {c.symbol: c for c in self.symbol_cfgs}
+        self.symbols = [c.symbol for c in self.symbol_cfgs]
+        self._multi = len(self.symbols) > 1
+        self._live_by_symbol: Dict[str, list] = {}
+        for c in self.symbol_cfgs:
+            strategies = []
+            if "PREV_DAY" in c.strategies:
+                strategies.append(PrevDayBreakoutStrategy(rr=c.rr_prev_day, risk_pct=c.risk_per_trade,
+                                                          symbol=c.symbol, price_scale=c.price_scale))
+            if "PREV_WEEK" in c.strategies:
+                strategies.append(PrevWeekBreakoutStrategy(rr=c.rr_prev_week, risk_pct=c.risk_per_trade, paper=False,
+                                                           symbol=c.symbol, price_scale=c.price_scale))
+            self._live_by_symbol[c.symbol] = strategies
+        self.live_strategies = [s for sym in self.symbols for s in self._live_by_symbol[sym]]
 
         self.paper_strategies = [
             TWKMomentumStrategy(rr=1.5, risk_pct=settings.RISK_PER_TRADE, paper=True),
@@ -110,14 +147,19 @@ class Engine:
         # conversion.
         self._broker_offset = detect_broker_offset_hours(broker)
 
-        self.risk   = RiskManager(starting_equity=broker.account_equity() or settings.STARTING_EQUITY)
-        self.symbol = settings.PRIMARY_SYMBOL
+        # Account-wide caps = totals across symbols (identical to the settings
+        # values when only the primary symbol trades); each symbol's own cap is
+        # enforced in _on_bar so one symbol can't use up another's slot.
+        self.risk   = RiskManager(
+            starting_equity=broker.account_equity() or settings.STARTING_EQUITY,
+            max_trades_per_day=sum(c.max_trades_per_day for c in self.symbol_cfgs),
+            max_concurrent_trades=settings.MAX_CONCURRENT_TRADES * len(self.symbols),
+        )
+        self.symbol = settings.PRIMARY_SYMBOL.upper()        # primary: paper strategies + legacy callers
 
-        self._last_bar_ts: Optional[datetime] = None
-        self._open_positions: Dict[str, dict] = {}           # strategy_name → meta
-        self._last_outcome_today: Optional[str] = None       # 'WIN' | 'LOSS' | None
-        self._recovery_trade_taken: bool = False             # one-shot after a loss
-        self._current_day = ""
+        self._sym: Dict[str, _SymbolState] = {s: _SymbolState() for s in self.symbols}
+        self._risk_day = ""                                  # account-level day roll happens once per day
+        self._open_positions: Dict[str, dict] = {}           # strategy_name (unique per symbol) → meta
 
         self._stop   = threading.Event()
         self._errors = 0
@@ -161,6 +203,11 @@ class Engine:
         logger.info(f"Engine starting. Mode={settings.MODE}")
         logger.info(f"Live strategies: {live_names}")
         logger.info(f"Paper strategies: {paper_names}")
+        if self._multi:
+            for c in self.symbol_cfgs:
+                logger.info(f"Symbol {c.symbol}: strategies={','.join(c.strategies)} price_scale={c.price_scale} "
+                            f"risk={c.risk_per_trade} rr_pd={c.rr_prev_day} rr_pw={c.rr_prev_week} "
+                            f"max_trades/day={c.max_trades_per_day}")
         if self.ftmo is not None:
             logger.info(f"FTMO GUARD ARMED — initial=${self.ftmo.cfg.initial_balance:,.0f} "
                         f"daily_stop={self.ftmo.cfg.daily_buffer_pct*100:.0f}% "
@@ -197,26 +244,31 @@ class Engine:
         logger.info("Shutdown complete.")
 
     def _ensure_symbol(self) -> None:
-        try:
-            info = self.broker.symbol_info(self.symbol)
-            logger.info(f"Symbol {self.symbol}: point={info['point']}, spread={info['spread_points']}")
-        except Exception as e:
-            logger.error(f"Symbol {self.symbol} not available: {e}")
+        for sym in self.symbols:
+            try:
+                info = self.broker.symbol_info(sym)
+                logger.info(f"Symbol {sym}: point={info['point']}, spread={info['spread_points']}")
+            except Exception as e:
+                logger.error(f"Symbol {sym} not available: {e}")
 
-    def _can_open_new_trade(self) -> bool:
+    def _can_open_new_trade(self, symbol: Optional[str] = None) -> bool:
         """
-        Trading gate logic:
+        Trading gate logic (per symbol):
         - No trades yet today          → allow
         - Last trade was WIN           → allow
         - Last trade was LOSS          → allow one recovery trade only
         - Recovery trade already taken → block for the rest of the day
         """
-        if self._last_outcome_today is None:
+        st = self._sym[symbol or self.symbol]
+        if st.last_outcome_today is None:
             return True
-        if self._last_outcome_today == "WIN":
+        if st.last_outcome_today == "WIN":
             return True
         # last outcome was LOSS
-        return not self._recovery_trade_taken
+        return not st.recovery_trade_taken
+
+    def _open_count(self, symbol: str) -> int:
+        return sum(1 for m in self._open_positions.values() if m.get("symbol", self.symbol) == symbol)
 
     def _tick(self) -> None:
         if os.path.exists(KILL_FILE):
@@ -225,21 +277,33 @@ class Engine:
                 self.notifier.send("🔴 Kill switch activated")
             return
 
-        bars = self.broker.get_bars(self.symbol, "M1", 3)
-        if len(bars) < 2: return
-        last = bars[-2]
+        # Each symbol has its own chart: process every symbol that has a new
+        # closed M1 bar. Symbols are independent; one without data is skipped.
+        for sym in self.symbols:
+            bars = self.broker.get_bars(sym, "M1", 3)
+            if len(bars) < 2: continue
+            last = bars[-2]
+            st = self._sym[sym]
+            if st.last_bar_ts is not None and last.ts <= st.last_bar_ts: continue
+            st.last_bar_ts = last.ts
+            self._on_bar(sym, last)
 
-        if self._last_bar_ts is not None and last.ts <= self._last_bar_ts: return
-        self._last_bar_ts = last.ts
-
+    def _on_bar(self, sym: str, last: Bar) -> None:
+        st = self._sym[sym]
         day = last.ts.strftime("%Y-%m-%d")
-        if day != self._current_day:
-            self._current_day = day
-            self._last_outcome_today = None
-            self._recovery_trade_taken = False
-            eq = self.broker.account_equity()
-            self.risk.on_new_day(eq)
-            logger.info(f"New day: {day}, equity=${eq:,.2f}")
+        if day != st.current_day:
+            st.current_day = day
+            st.last_outcome_today = None
+            st.recovery_trade_taken = False
+            st.trades_today = 0
+            # Account-level roll exactly once per broker day, by whichever
+            # symbol reaches the new day first (a second roll would wipe the
+            # day's trade count and starting equity).
+            if day != self._risk_day:
+                self._risk_day = day
+                eq = self.broker.account_equity()
+                self.risk.on_new_day(eq)
+                logger.info(f"New day: {day}, equity=${eq:,.2f}")
 
         # ── FTMO guard: update on every tick with live equity/balance ──
         if self.ftmo is not None:
@@ -260,8 +324,8 @@ class Engine:
                     self._force_close(_sn, last)
                 self.notifier.send(f"🛡️ FTMO guard: {_reason}\nClosed open positions.")
 
-        # ── Process open live positions (EOD close, fill checks) ───────────
-        for sn in list(self._open_positions.keys()):
+        # ── Process this symbol's open live positions (EOD close, fill checks) ──
+        for sn in [k for k, m in self._open_positions.items() if m.get("symbol", self.symbol) == sym]:
             strategy = self._find_strategy(sn)
             if strategy is None: continue
 
@@ -272,16 +336,17 @@ class Engine:
             self._check_closed(sn)
 
             if isinstance(self.broker, PaperBroker):
-                closed = self.broker.on_new_bar(self.symbol, last)
+                closed = self.broker.on_new_bar(sym, last)
                 for ticket, pnl in closed:
                     if ticket == self._open_positions.get(sn, {}).get("ticket"):
                         self._record_close(sn, ticket, pnl, last)
 
-        # ── Run paper strategies independently (always) ────────────────────
-        for strategy in self.paper_strategies:
-            strategy.on_bar(last, self.symbol)  # handles its own sim internally
+        # ── Run paper strategies independently (always; primary symbol only) ──
+        if sym == self.symbol:
+            for strategy in self.paper_strategies:
+                strategy.on_bar(last, sym)  # handles its own sim internally
 
-        # ── Risk gate ──────────────────────────────────────────────────────
+        # ── Risk gate (account-wide) ──────────────────────────────────────
         if self.risk.state.paused: return
         ok, _ = self.risk.can_trade(last.ts)
         if not ok: return
@@ -294,12 +359,18 @@ class Engine:
                 logger.info(f"[FTMO] trading blocked: {reason}")
                 return
 
-        for strategy in self.live_strategies:
+        # ── Per-symbol caps (multi-symbol only; single-symbol relies on the
+        #    RiskManager checks above, exactly as before) ─────────────────────
+        if self._multi:
+            if st.trades_today >= self._cfg[sym].max_trades_per_day: return
+            if self._open_count(sym) >= settings.MAX_CONCURRENT_TRADES: return
+
+        for strategy in self._live_by_symbol[sym]:
             sn = strategy.strategy_name
 
             if sn in self._open_positions: continue
 
-            if not self._can_open_new_trade():
+            if not self._can_open_new_trade(sym):
                 logger.info(f"[{sn}] Skipped — daily loss gate active")
                 continue
 
@@ -307,8 +378,9 @@ class Engine:
             # ENTRY filter only; positions already open are handled above and
             # left to hit their SL/TP normally. Other strategies (ORB_5MIN,
             # PREV_WEEK_BREAKOUT, FVG_RETEST) are unaffected and still get
-            # evaluated this tick.
-            if sn == "PREV_DAY_BREAKOUT":
+            # evaluated this tick. Matches every symbol's PREV_DAY copy
+            # (e.g. PREV_DAY_BREAKOUT_BTCUSD).
+            if sn.startswith("PREV_DAY_BREAKOUT"):
                 if not has_confirmed_broker_offset():
                     # No offset has ever been confirmed from live tick/bar data
                     # this session — self._broker_offset is only a configured
@@ -331,7 +403,7 @@ class Engine:
                         )
                         continue
 
-            sig = strategy.on_bar(last, self.symbol)
+            sig = strategy.on_bar(last, sym)
 
             if sig is not None:
                 self._execute(strategy, sig)
@@ -343,7 +415,8 @@ class Engine:
         return None
 
     def _execute(self, strategy, sig) -> None:
-        info = self.broker.symbol_info(self.symbol)
+        sym  = getattr(strategy, "symbol", self.symbol)
+        info = self.broker.symbol_info(sym)
         lots = strategy.compute_lots(
             equity=self.broker.account_equity(),
             risk_dist=sig.risk_dist, point=info["point"],
@@ -369,7 +442,7 @@ class Engine:
                 return
 
         pos = self.broker.place_market(
-            self.symbol, sig.side, lots, sig.sl, sig.tp,
+            sym, sig.side, lots, sig.sl, sig.tp,
             comment=f"{sig.strategy[:8]}_{sig.side.value}",
         )
         if pos is None or pos.ticket is None:
@@ -415,16 +488,19 @@ class Engine:
         self._open_positions[sig.strategy] = {
             "ticket": pos.ticket, "signal": sig, "lots": lots,
             "entry": pos.entry, "risk_ccy": max(risk_ccy, 1e-9),
+            "symbol": sym,
         }
-        if self._last_outcome_today == "LOSS":
-            self._recovery_trade_taken = True
+        st = self._sym[sym]
+        st.trades_today += 1
+        if st.last_outcome_today == "LOSS":
+            st.recovery_trade_taken = True
             logger.info(f"[{sig.strategy}] Recovery trade opened after today's loss")
         self.risk.record_trade_open()
         if self.ftmo is not None:
             self.ftmo.record_trade_day()
 
         self.notifier.send(
-            f"📥 *[{sig.strategy}]* {sig.side.value} `{self.symbol}` {lots} lots\n"
+            f"📥 *[{sig.strategy}]* {sig.side.value} `{sym}` {lots} lots\n"
             f"Entry: `{pos.entry:.2f}` SL: `{sig.sl:.2f}` TP: `{sig.tp:.2f}`\n"
             f"Risk: `${risk_ccy:.2f}` | {sig.note}"
         )
@@ -436,7 +512,8 @@ class Engine:
     def _check_closed(self, sn: str) -> None:
         meta = self._open_positions.get(sn)
         if not meta: return
-        if meta["ticket"] not in {p.ticket for p in self.broker.open_positions(self.symbol)}:
+        sym = meta.get("symbol", self.symbol)
+        if meta["ticket"] not in {p.ticket for p in self.broker.open_positions(sym)}:
             # Source of truth: realized P/L from broker deal history. Only if
             # that is unavailable do we fall back to recomputing from the entry
             # and current tick — that fallback is an APPROXIMATION and was the
@@ -445,9 +522,9 @@ class Engine:
             pnl = self.broker.realized_pnl(meta["ticket"])
             if pnl is None:
                 sig  = meta["signal"]
-                info = self.broker.symbol_info(self.symbol)
+                info = self.broker.symbol_info(sym)
                 try:
-                    tick = self.broker.tick(self.symbol)
+                    tick = self.broker.tick(sym)
                     ep   = tick["bid"] if sig.side == Side.BUY else tick["ask"]
                     pts  = (ep - meta["entry"]) / info["point"]
                     if sig.side == Side.SELL: pts = -pts
@@ -477,9 +554,10 @@ class Engine:
         r       = pnl / meta.get("risk_ccy", 1e-9)
         outcome = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BE")
         emoji   = "✅" if pnl > 0 else ("❌" if pnl < 0 else "➖")
-        self._last_outcome_today = "WIN" if pnl >= 0 else "LOSS"
-        if self._last_outcome_today == "WIN":
-            self._recovery_trade_taken = False  # WIN resets recovery slot
+        st = self._sym[meta.get("symbol", self.symbol)]
+        st.last_outcome_today = "WIN" if pnl >= 0 else "LOSS"
+        if st.last_outcome_today == "WIN":
+            st.recovery_trade_taken = False  # WIN resets recovery slot
         self.risk.record_trade_close(pnl)
         eq = self.broker.account_equity()
         # Authoritatively mirror the broker's real equity into the RiskManager

@@ -48,13 +48,20 @@ def _iso_week(d: datetime) -> str:
 
 
 class RiskManager:
-    def __init__(self, starting_equity: float = 10_000.0):
+    def __init__(self, starting_equity: float = 10_000.0,
+                 max_trades_per_day: Optional[int] = None,
+                 max_concurrent_trades: Optional[int] = None):
         self.state = RiskState(
             equity_start_of_day=starting_equity,
             equity=starting_equity,
             week_start_equity=starting_equity,
         )
         self._current_week = _iso_week(datetime.now(timezone.utc))
+        # Account-wide caps. None = use settings (single-symbol behaviour). The
+        # multi-symbol engine passes the totals across symbols and enforces each
+        # symbol's own cap itself, so one symbol's trade can't block another's.
+        self.max_trades_per_day = max_trades_per_day
+        self.max_concurrent_trades = max_concurrent_trades
 
     # ---------- equity roll-over ----------
 
@@ -109,10 +116,12 @@ class RiskManager:
         if weekly_dd <= -settings.MAX_WEEKLY_LOSS:
             return False, f"weekly loss cap hit ({weekly_dd*100:.2f}%)"
 
-        if self.state.daily.trades >= settings.MAX_TRADES_PER_DAY:
+        max_trades = self.max_trades_per_day if self.max_trades_per_day is not None else settings.MAX_TRADES_PER_DAY
+        if self.state.daily.trades >= max_trades:
             return False, "max trades per day reached"
 
-        if self.state.open_positions >= settings.MAX_CONCURRENT_TRADES:
+        max_open = self.max_concurrent_trades if self.max_concurrent_trades is not None else settings.MAX_CONCURRENT_TRADES
+        if self.state.open_positions >= max_open:
             return False, "max concurrent trades reached"
 
         # cool-down after N consecutive losses
