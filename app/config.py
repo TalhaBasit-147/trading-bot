@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     # with the D1 EMA50 regime (prev day's D1 close vs D1 EMA50). Toggle off
     # to trade every fresh cross regardless of daily trend, with no code change.
     PREV_DAY_TREND_FILTER_ENABLED: bool = True
+    # Daily pre-session briefing (Telegram + log): today's high-impact USD
+    # releases, weekly bias and key levels per traded symbol. Context only.
+    BRIEFING_ENABLED: bool = True
+    BRIEFING_HOUR_ET: int = 8
 
     # MT5
     MT5_LOGIN: int | None = None

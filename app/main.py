@@ -64,6 +64,8 @@ from app.strategy.orb_5min import ORB5MinStrategy
 from app.strategy.risk import RiskManager
 from app.strategy.ftmo_guard import FTMOGuard, FTMOConfig
 from app.symbols import load_symbol_configs
+from app import briefing
+from app.strategy.news_filter import usd_high_impact_events
 
 
 KILL_FILE = "./KILL"
@@ -159,6 +161,7 @@ class Engine:
 
         self._sym: Dict[str, _SymbolState] = {s: _SymbolState() for s in self.symbols}
         self._risk_day = ""                                  # account-level day roll happens once per day
+        self._briefing_day = None                            # New York date of the last pre-session briefing
         self._open_positions: Dict[str, dict] = {}           # strategy_name (unique per symbol) → meta
 
         self._stop   = threading.Event()
@@ -305,6 +308,9 @@ class Engine:
                 self.risk.on_new_day(eq)
                 logger.info(f"New day: {day}, equity=${eq:,.2f}")
 
+        if sym == self.symbol:
+            self._maybe_send_briefing(last)
+
         # ── FTMO guard: update on every tick with live equity/balance ──
         if self.ftmo is not None:
             try:
@@ -407,6 +413,25 @@ class Engine:
 
             if sig is not None:
                 self._execute(strategy, sig)
+
+    def _maybe_send_briefing(self, last: Bar) -> None:
+        """Once per weekday at BRIEFING_HOUR_ET (New York): today's USD releases, weekly
+        bias and key levels for every traded symbol. Context only; never places trades
+        and never lets a failure reach the trading loop."""
+        if not settings.BRIEFING_ENABLED:
+            return
+        try:
+            et = briefing.to_et(to_utc(last.ts, self._broker_offset))
+            if et.weekday() >= 5 or et.time() < time(settings.BRIEFING_HOUR_ET, 0) or self._briefing_day == et.date():
+                return
+            self._briefing_day = et.date()
+            snaps = [briefing.symbol_snapshot(s, self.broker.get_bars(s, "H1", 200), self.broker.get_bars(s, "D1", 20))
+                     for s in self.symbols]
+            text = briefing.format_briefing(et, usd_high_impact_events(et.date()), snaps)
+            self.notifier.send(text)
+            logger.info("[BRIEFING]\n" + text)
+        except Exception as e:
+            logger.warning(f"[BRIEFING] skipped: {e}")
 
     def _find_strategy(self, name: str):
         for s in self._all_strategies:
