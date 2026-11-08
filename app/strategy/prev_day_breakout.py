@@ -30,7 +30,7 @@ from loguru import logger
 
 from app.config import settings
 from app.core.types import Bar, Side
-from app.strategy.broker_time import detect_broker_offset_hours, to_utc
+from app.strategy.broker_time import detect_broker_offset_hours, server_clock, to_utc
 
 
 @dataclass
@@ -227,7 +227,7 @@ class PrevDayBreakoutStrategy:
             import MetaTrader5 as mt5
             day_start = datetime(day.year, day.month, day.day, 0, 0, 0)
             day_end = day_start + timedelta(days=1)
-            rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M1, day_start, day_end)
+            rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M1, server_clock(day_start), server_clock(day_end))
             if rates is None or len(rates) == 0:
                 return []
             return [type('B', (), {'high': float(r['high']), 'low': float(r['low'])}) for r in rates]

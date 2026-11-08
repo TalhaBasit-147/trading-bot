@@ -160,3 +160,16 @@ def to_utc(broker_ts: datetime, offset_hours: float) -> datetime:
     offset_hours: e.g. 3 (or 3.0) means broker = UTC+3
     """
     return _naive(broker_ts) - timedelta(hours=offset_hours)
+
+
+def server_clock(dt: datetime) -> datetime:
+    """A broker-server wall-clock time as MetaTrader5.copy_rates_range expects it.
+
+    MT5 stores bar times as broker-server wall clock and compares the range
+    bounds against them, but it converts a NAIVE datetime from the PC's LOCAL
+    time zone first (the VPS is UTC+1, the broker UTC+2/+3), which shifted every
+    "previous day/week" window by an hour. Passing the same wall-clock value
+    tagged as UTC makes MT5 use it unchanged, so a day window is exactly the
+    broker day, the same day MT5's own D1 candle covers.
+    """
+    return _naive(dt).replace(tzinfo=timezone.utc)

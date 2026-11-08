@@ -32,7 +32,7 @@ from loguru import logger
 
 from app.config import settings
 from app.core.types import Bar, Side
-from app.strategy.broker_time import detect_broker_offset_hours, to_utc
+from app.strategy.broker_time import detect_broker_offset_hours, server_clock, to_utc
 
 
 # ── Session in TRUE UTC (NY session) ──────────────────────────────────────
@@ -164,7 +164,7 @@ class PrevWeekBreakoutStrategy:
     def _get_range_bars(self, symbol: str, start: datetime, end: datetime) -> list:
         try:
             import MetaTrader5 as mt5
-            rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M1, start, end)
+            rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M1, server_clock(start), server_clock(end))
             if rates is None or len(rates) == 0:
                 return []
             return [type('B', (), {
