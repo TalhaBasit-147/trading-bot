@@ -11,6 +11,14 @@ import pytest
 from app.core.types import Bar
 
 
+@pytest.fixture(autouse=True)
+def _offline_calendar(monkeypatch):
+    """No test may reach the live Forex Factory feed: every test sees an empty
+    calendar unless it installs its own fake fetcher."""
+    import app.strategy.news_filter as nf
+    monkeypatch.setattr(nf, "_calendar", nf._Calendar(fetcher=lambda: []))
+
+
 def mk_bar(ts: datetime, o: float, h: float, l: float, c: float, v: float = 100.0) -> Bar:
     return Bar(ts=ts, open=o, high=h, low=l, close=c, volume=v)
 

@@ -1,193 +1,157 @@
-"""News blackout filter for gold trading bot.
+"""News blackout + economic calendar for the trading bot.
 
-Blocks trading during ±30 minutes around the three events that most
-violently move XAUUSD:
-  1. Non-Farm Payrolls (NFP)       — first Friday of month, 13:30 UTC
-  2. CPI (Consumer Price Index)    — ~2nd/3rd week of month, 13:30 UTC  
-  3. FOMC Rate Decision            — 8x per year, 19:00 UTC
+Blocks new entries during ±30 minutes around the USD releases that most
+violently move XAUUSD: Non-Farm Payrolls, CPI and the FOMC decision.
 
-Uses forex-calendar.pro free API (100 req/15min, no card required).
-Falls back gracefully if API is unavailable — never blocks trades on error.
+Source: Forex Factory's free weekly calendar feed (no key, no account):
+    https://nfs.faireconomy.media/ff_calendar_thisweek.json
+Fields per event: title, country, date (ET with UTC offset), impact,
+forecast, previous. There is no "actual" field, which is fine: the
+blackout only needs the scheduled time.
 
-Registration: https://forex-calendar.pro (free, just an email)
-Set API key in .env as: NEWS_API_KEY=your_key_here
+The previous version called forex-calendar.pro with NEWS_API_KEY read from
+os.environ. Nothing ever loads .env into os.environ and `requests` was not
+installed, so it silently never blocked anything. This version needs no key
+and uses httpx (already a dependency).
+
+Contract (unchanged): never block trading because of a feed problem. Any
+fetch/parse failure means "no blackout". The feed is cached for an hour so
+the bot fetches it about 25 times a day.
 """
 from __future__ import annotations
 
-import os
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Tuple
 import threading
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from typing import Callable, List, Optional, Tuple
 
 from loguru import logger
 
-try:
-    import requests as _requests
-    _REQUESTS_AVAILABLE = True
-except ImportError:
-    _REQUESTS_AVAILABLE = False
+FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+API_TIMEOUT = 5            # seconds; fail fast, never stall the engine
+CACHE_MINUTES = 60         # successful fetch is reused this long
+RETRY_MINUTES = 5          # after a failed fetch, wait this long before retrying
 
-
-# ── Configuration ──────────────────────────────────────────────────────────
-
-# Minutes before and after a high-impact event to block trading
+# Minutes before and after a blocked event during which new entries are skipped
 BLACKOUT_MINUTES_BEFORE = 30
 BLACKOUT_MINUTES_AFTER = 30
 
-# Only block these specific events (case-insensitive substring match)
-BLOCKED_EVENT_KEYWORDS = [
-    "non-farm",
-    "nonfarm",
-    "nfp",
-    "consumer price index",
-    "cpi",
-    "fomc",
-    "federal funds rate",
-    "fed rate",
-]
-
-# Cache the API response for this many minutes (avoid hammering the API)
-CACHE_MINUTES = 15
-
-# API endpoint
-CALENDAR_API_URL = "https://api.forex-calendar.pro/events/upcoming"
-
-# Timeout for the API call (seconds) — fail fast, never block the bot
-API_TIMEOUT = 4
+# Blocked releases (USD, case-insensitive substring of the Forex Factory title).
+# Titles look like "Non-Farm Employment Change", "CPI m/m", "Core CPI m/m",
+# "Federal Funds Rate", "FOMC Statement", "FOMC Press Conference".
+BLOCKED_EVENT_KEYWORDS = ["non-farm", "nonfarm", "cpi", "federal funds rate", "fomc"]
 
 
-# ── Internal cache ─────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class CalendarEvent:
+    title: str
+    country: str
+    impact: str
+    time_utc: datetime        # naive UTC
+    forecast: str = ""
+    previous: str = ""
 
-class _NewsCache:
-    def __init__(self):
-        self._events = []
+    @property
+    def is_blocked(self) -> bool:
+        # High impact only: the keywords alone also match low-impact items such as
+        # "FOMC Member X Speaks", "ADP Non-Farm Employment Change" and
+        # "Prelim Nonfarm Productivity" (8 of 9 matches in the week of 2026-11-02).
+        t = self.title.lower()
+        return (self.country.upper() == "USD" and self.impact.lower() == "high"
+                and any(k in t for k in BLOCKED_EVENT_KEYWORDS))
+
+
+def parse_feed(items: list) -> List[CalendarEvent]:
+    """Parse the Forex Factory weekly JSON into CalendarEvents (bad rows are skipped)."""
+    out: List[CalendarEvent] = []
+    for e in items or []:
+        try:
+            ts = datetime.fromisoformat(str(e["date"]))
+            ts = ts.astimezone(timezone.utc).replace(tzinfo=None) if ts.tzinfo else ts
+            out.append(CalendarEvent(title=str(e.get("title", "")), country=str(e.get("country", "")),
+                                     impact=str(e.get("impact", "")), time_utc=ts,
+                                     forecast=str(e.get("forecast", "") or ""), previous=str(e.get("previous", "") or "")))
+        except Exception:
+            continue
+    return out
+
+
+def _http_fetch() -> list:
+    import httpx
+    r = httpx.get(FEED_URL, timeout=API_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (trading-bot calendar)"})
+    r.raise_for_status()
+    return r.json()
+
+
+class _Calendar:
+    def __init__(self, fetcher: Callable[[], list] = _http_fetch):
+        self._fetcher = fetcher
+        self._events: List[CalendarEvent] = []
         self._fetched_at: Optional[datetime] = None
+        self._failed_at: Optional[datetime] = None
         self._lock = threading.Lock()
 
-    def is_stale(self) -> bool:
-        if self._fetched_at is None:
-            return True
-        age = (datetime.now(timezone.utc) - self._fetched_at).total_seconds()
-        return age > CACHE_MINUTES * 60
-
-    def update(self, events: list) -> None:
+    def events(self, now: Optional[datetime] = None) -> List[CalendarEvent]:
+        now = now or datetime.now(timezone.utc).replace(tzinfo=None)
         with self._lock:
-            self._events = events
-            self._fetched_at = datetime.now(timezone.utc)
-
-    def get(self) -> list:
-        with self._lock:
+            fresh = self._fetched_at is not None and now - self._fetched_at < timedelta(minutes=CACHE_MINUTES)
+            backing_off = self._failed_at is not None and now - self._failed_at < timedelta(minutes=RETRY_MINUTES)
+            if not fresh and not backing_off:
+                try:
+                    self._events = parse_feed(self._fetcher())
+                    self._fetched_at, self._failed_at = now, None
+                    logger.info(f"[NewsFilter] calendar refreshed: {len(self._events)} events this week, "
+                                f"{sum(e.is_blocked for e in self._events)} blocked USD releases")
+                except Exception as e:
+                    self._failed_at = now
+                    logger.warning(f"[NewsFilter] calendar fetch failed ({e}); not blocking any trades until it recovers")
             return list(self._events)
 
 
-_cache = _NewsCache()
+_calendar = _Calendar()
 
 
-# ── API fetch ──────────────────────────────────────────────────────────────
+def _utcnow(now: Optional[datetime]) -> datetime:
+    if now is None:
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+    return now.astimezone(timezone.utc).replace(tzinfo=None) if now.tzinfo else now
 
-def _fetch_events(api_key: str) -> list:
-    """Fetch upcoming high-impact USD events from forex-calendar.pro."""
-    if not _REQUESTS_AVAILABLE:
-        return []
-    try:
-        resp = _requests.get(
-            CALENDAR_API_URL,
-            headers={"X-API-Key": api_key},
-            params={
-                "impact": "HIGH",
-                "currency": "USD",
-                "hours": 4,   # look 4 hours ahead
-            },
-            timeout=API_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            logger.warning(f"[NewsFilter] API returned {resp.status_code}")
-            return []
-        data = resp.json()
-        return data.get("events", [])
-    except Exception as e:
-        logger.warning(f"[NewsFilter] API fetch failed: {e}")
-        return []
-
-
-# ── Main public function ───────────────────────────────────────────────────
 
 def is_news_blackout(now: Optional[datetime] = None) -> Tuple[bool, str]:
-    """
-    Check whether we are in a news blackout window.
-
-    Returns:
-        (blocked: bool, reason: str)
-        
-    Always returns (False, "") on any error — we never block trading
-    due to an API failure. The bot should trade normally if this
-    function can't reach the calendar.
-
-    Usage in strategy:
-        blocked, reason = is_news_blackout()
-        if blocked:
-            logger.info(f"Skipping — {reason}")
-            return None
-    """
-    if now is None:
-        now = datetime.now(timezone.utc)
-
-    api_key = os.environ.get("NEWS_API_KEY", "")
-    if not api_key:
-        # No key configured — log once, never block
-        return False, ""
-
-    # Refresh cache if stale
-    if _cache.is_stale():
-        events = _fetch_events(api_key)
-        _cache.update(events)
-
-    events = _cache.get()
-    if not events:
-        return False, ""
-
-    for event in events:
-        name = event.get("name", "").lower()
-        minutes_until = event.get("minutes_until", 999)
-
-        # Only block on our specific keywords
-        if not any(kw in name for kw in BLOCKED_EVENT_KEYWORDS):
-            continue
-
-        # Block if we're within the blackout window
-        # minutes_until is negative if the event already passed
-        if -BLACKOUT_MINUTES_AFTER <= minutes_until <= BLACKOUT_MINUTES_BEFORE:
-            display_name = event.get("name", "Unknown event")
-            if minutes_until >= 0:
-                reason = f"{display_name} in {minutes_until}min (blackout ±{BLACKOUT_MINUTES_BEFORE}min)"
-            else:
-                reason = f"{display_name} released {abs(minutes_until)}min ago (blackout ±{BLACKOUT_MINUTES_AFTER}min)"
-            logger.info(f"[NewsFilter] BLACKOUT — {reason}")
-            return True, reason
-
+    """(blocked, reason). Blocks within -30/+30 min of NFP, CPI or FOMC. Never blocks on a feed error."""
+    now = _utcnow(now)
+    try:
+        for ev in _calendar.events(now):
+            if not ev.is_blocked:
+                continue
+            minutes_until = (ev.time_utc - now).total_seconds() / 60.0
+            if -BLACKOUT_MINUTES_AFTER <= minutes_until <= BLACKOUT_MINUTES_BEFORE:
+                if minutes_until >= 0:
+                    reason = f"{ev.title} in {minutes_until:.0f}min (blackout ±{BLACKOUT_MINUTES_BEFORE}min)"
+                else:
+                    reason = f"{ev.title} released {abs(minutes_until):.0f}min ago (blackout ±{BLACKOUT_MINUTES_AFTER}min)"
+                logger.info(f"[NewsFilter] BLACKOUT — {reason}")
+                return True, reason
+    except Exception as e:
+        logger.warning(f"[NewsFilter] blackout check failed ({e}); not blocking")
     return False, ""
 
 
-# ── Standalone test ────────────────────────────────────────────────────────
+def usd_high_impact_events(day_et: date, now: Optional[datetime] = None) -> List[CalendarEvent]:
+    """High-impact USD events whose New York date is `day_et` (for the daily briefing)."""
+    from app.briefing import to_et
+    try:
+        evs = _calendar.events(_utcnow(now))
+    except Exception:
+        return []
+    return sorted([e for e in evs if e.country.upper() == "USD" and e.impact.lower() == "high" and to_et(e.time_utc).date() == day_et],
+                  key=lambda e: e.time_utc)
+
 
 if __name__ == "__main__":
-    import sys
-    key = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NEWS_API_KEY", "")
-    if not key:
-        print("Usage: python news_filter.py YOUR_API_KEY")
-        print("Or set NEWS_API_KEY in environment")
-        sys.exit(1)
-
-    os.environ["NEWS_API_KEY"] = key
     blocked, reason = is_news_blackout()
-    if blocked:
-        print(f"🔴 BLACKOUT: {reason}")
-    else:
-        print("✅ No blackout — safe to trade")
-        events = _fetch_events(key)
-        if events:
-            print(f"\nUpcoming high-impact USD events (next 4 hours):")
-            for e in events:
-                print(f"  - {e.get('name')} in {e.get('minutes_until')}min")
-        else:
-            print("No high-impact USD events in next 4 hours")
+    print(f"BLACKOUT: {reason}" if blocked else "No blackout right now")
+    for e in _calendar.events():
+        if e.country == "USD" and e.impact == "High":
+            print(f"  {e.time_utc:%a %Y-%m-%d %H:%M} UTC  {e.title}  (forecast {e.forecast or '-'}, previous {e.previous or '-'})"
+                  f"{'  [BLOCKED]' if e.is_blocked else ''}")
