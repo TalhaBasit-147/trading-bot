@@ -63,6 +63,7 @@ def test_engine_sends_one_briefing_per_new_york_day(monkeypatch, tmp_path):
     eng._broker_offset = 3.0                                     # broker = UTC+3 in June
     # raw 14:55 -> 07:55 ET (too early); raw 15:05 -> 08:05 ET (send); raw 15:10 (already sent)
     for k, raw in enumerate([datetime(2026, 6, 2, 14, 55), datetime(2026, 6, 2, 15, 5), datetime(2026, 6, 2, 15, 10)]):
+        eng._now = lambda raw=raw: raw - timedelta(hours=3) + timedelta(minutes=2)   # live: bar just closed
         for sym in feed:
             _push(feed, sym, raw, 4000, 4001, 3999, 4000)
             _push(feed, sym, raw + timedelta(minutes=1), 4000, 4001, 3999, 4000)   # engine reads the last CLOSED bar
@@ -74,6 +75,7 @@ def test_engine_sends_one_briefing_per_new_york_day(monkeypatch, tmp_path):
 def test_briefing_failure_never_breaks_the_tick(monkeypatch, tmp_path):
     eng, feed = _engine(monkeypatch, tmp_path, "")
     eng._broker_offset = 3.0
+    eng._now = lambda: datetime(2026, 6, 2, 12, 7)                # live (raw 15:05 = 12:05 UTC)
     monkeypatch.setattr(B, "symbol_snapshot", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
     for raw in (datetime(2026, 6, 2, 15, 5), datetime(2026, 6, 2, 15, 6)):
         _push(feed, "XAUUSD", raw, 4000, 4001, 3999, 4000)
