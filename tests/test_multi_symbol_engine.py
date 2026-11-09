@@ -25,6 +25,7 @@ def _engine(monkeypatch, tmp_path, trade_symbols):
     for name in ("ORB5MinStrategy", "PrevDayBreakoutStrategy", "PrevWeekBreakoutStrategy", "TWKMomentumStrategy"):
         monkeypatch.setattr(getattr(main_mod, name), "set_broker", lambda self, broker: None, raising=False)
     monkeypatch.setattr(main_mod, "detect_broker_offset_hours", lambda broker, *a: 3.0)
+    monkeypatch.setattr(main_mod, "confirmed_broker_offset", lambda: None)   # deterministic: nothing confirmed
     feed = {"XAUUSD": [], "BTCUSD": []}
     broker = PaperBroker(starting_equity=1000.0, bar_provider=lambda s, tf, n: feed[s][-n:],
                          symbol_specs={"XAUUSD": GOLD, "BTCUSD": BTC, "EURUSD": GOLD})

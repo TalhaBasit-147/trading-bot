@@ -42,7 +42,7 @@ import signal
 import threading
 import time as time_mod
 from dataclasses import dataclass
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Dict, List, Optional
 from app.strategy.twk_momentum import TWKMomentumStrategy
 import uvicorn
@@ -57,7 +57,7 @@ from app.execution.base import Broker
 from app.execution.paper_broker import PaperBroker
 from app.monitoring.logging_setup import setup_logging
 from app.notify.telegram import Telegram
-from app.strategy.broker_time import detect_broker_offset_hours, has_confirmed_broker_offset, to_utc
+from app.strategy.broker_time import confirmed_broker_offset, detect_broker_offset_hours, has_confirmed_broker_offset, to_utc
 from app.strategy.prev_day_breakout import PrevDayBreakoutStrategy
 from app.strategy.prev_week_breakout import PrevWeekBreakoutStrategy
 from app.strategy.orb_5min import ORB5MinStrategy
@@ -148,6 +148,11 @@ class Engine:
         # clock they already gate their own session windows on. Not a new/second
         # conversion.
         self._broker_offset = detect_broker_offset_hours(broker)
+        # A strategy whose own symbol had no fresh tick at startup (gold at the
+        # weekend) fell back to the configured default; if any symbol confirmed
+        # the real offset, give it to everyone (one server clock for all).
+        self._apply_confirmed_offset()
+        self._offset_checked_at: Optional[datetime] = None   # last hourly re-check (UTC)
 
         # Account-wide caps = totals across symbols (identical to the settings
         # values when only the primary symbol trades); each symbol's own cap is
@@ -308,7 +313,10 @@ class Engine:
                 self.risk.on_new_day(eq)
                 logger.info(f"New day: {day}, equity=${eq:,.2f}")
 
-        if sym == self.symbol:
+        # Not gated on freshness: after a broker DST change the bars read an hour off
+        # and would look stale forever. Detection itself ignores stale data safely.
+        self._recheck_offset(sym)
+        if sym == self.symbol and self._is_fresh(last):      # never brief off a stale (weekend) bar
             self._maybe_send_briefing(last)
 
         # ── FTMO guard: update on every tick with live equity/balance ──
@@ -413,6 +421,43 @@ class Engine:
 
             if sig is not None:
                 self._execute(strategy, sig)
+
+    # ── Broker clock: one server clock shared by every symbol ──────────────
+    OFFSET_RECHECK = timedelta(hours=1)
+    FRESH_BAR = timedelta(minutes=10)
+
+    def _now(self) -> datetime:
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def _is_fresh(self, last: Bar) -> bool:
+        """True if this closed bar is live market data (not a weekend/holiday leftover)."""
+        return abs(self._now() - to_utc(last.ts, self._broker_offset)) <= self.FRESH_BAR
+
+    def _apply_confirmed_offset(self) -> None:
+        off = confirmed_broker_offset()
+        if off is None:
+            return
+        changed = [s.strategy_name for s in self.live_strategies + self.paper_strategies
+                   if getattr(s, "_broker_offset", None) != off]
+        for s in self.live_strategies + self.paper_strategies:
+            s._broker_offset = off
+        if changed or self._broker_offset != off:
+            logger.info(f"[broker_time] applying confirmed offset {off:+.1f} to engine and {len(changed)} "
+                        f"strategies ({', '.join(changed) or 'none'})")
+        self._broker_offset = off
+
+    def _recheck_offset(self, sym: str) -> None:
+        """Hourly, from a symbol that is trading live: re-detect the offset and apply it
+        everywhere. Covers a start with nothing confirmed and DST changes mid-session."""
+        now = self._now()
+        if self._offset_checked_at is not None and now - self._offset_checked_at < self.OFFSET_RECHECK:
+            return
+        self._offset_checked_at = now
+        try:
+            detect_broker_offset_hours(self.broker, sym)
+            self._apply_confirmed_offset()
+        except Exception as e:
+            logger.warning(f"[broker_time] hourly re-check failed: {e}")
 
     def _maybe_send_briefing(self, last: Bar) -> None:
         """Once per weekday at BRIEFING_HOUR_ET (New York): today's USD releases, weekly

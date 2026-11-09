@@ -76,6 +76,13 @@ def has_confirmed_broker_offset() -> bool:
     return _last_good_offset is not None
 
 
+def confirmed_broker_offset() -> Optional[float]:
+    """The last offset this process confirmed from live data, or None. Every
+    symbol shares the broker's one server clock, so any symbol's confirmation
+    is valid for all of them."""
+    return _last_good_offset
+
+
 def _naive(ts: datetime) -> datetime:
     return ts.replace(tzinfo=None) if ts.tzinfo is not None else ts
 
