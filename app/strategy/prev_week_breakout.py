@@ -32,6 +32,7 @@ from loguru import logger
 
 from app.config import settings
 from app.core.types import Bar, Side
+from app.strategy.sizing import risk_lots
 from app.strategy.broker_time import detect_broker_offset_hours, server_clock, to_utc
 
 
@@ -379,11 +380,7 @@ class PrevWeekBreakoutStrategy:
         return to_utc(bar.ts, getattr(self, '_broker_offset', 3)).time() >= CLOSE_DEADLINE
 
     def compute_lots(self, equity, risk_dist, point=0.01, tick_value=1.0,
-                     min_lot=0.01, max_lot=1.0):
+                     min_lot=0.01, max_lot=1.0, lot_step=0.01):
         if self.paper:
             return 0.0
-        risk_cash = equity * self.risk_pct
-        loss_per_lot = (risk_dist / point) * tick_value
-        if loss_per_lot <= 0:
-            return 0.0
-        return min(max_lot, max(min_lot, round(risk_cash / loss_per_lot, 2)))
+        return risk_lots(equity, self.risk_pct, risk_dist, point, tick_value, min_lot, max_lot, lot_step)

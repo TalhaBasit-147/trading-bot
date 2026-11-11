@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     # and must never silently become the live trading list.
     # Per-symbol keys (see app/symbols.py): <SYM>_PRICE_SCALE (required for any
     # non-primary symbol), <SYM>_STRATEGIES, <SYM>_RISK_PER_TRADE,
-    # <SYM>_RR_PREV_DAY, <SYM>_RR_PREV_WEEK, <SYM>_MAX_TRADES_PER_DAY.
+    # <SYM>_RR_PREV_DAY, <SYM>_RR_PREV_WEEK, <SYM>_MAX_TRADES_PER_DAY, <SYM>_MAX_LOTS.
     TRADE_SYMBOLS: str = ""
 
     # timeframes
@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     MAX_WEEKLY_LOSS: float = 0.10
     MAX_TRADES_PER_DAY: int = 1
     MAX_CONCURRENT_TRADES: int = 1
+    # Last-line order guards (app/strategy/sizing.py), independent of strategy sizing:
+    # refuse any order whose stop would lose more than MAX_TRADE_RISK_PCT of equity,
+    # or that is bigger than MAX_LOTS (per symbol: <SYM>_MAX_LOTS). With high account
+    # leverage the broker no longer rejects an absurd size, so the bot must.
+    MAX_TRADE_RISK_PCT: float = 0.05
+    MAX_LOTS: float = 0.10
     MIN_RR: float = 1.0
     CONSEC_LOSS_COOLDOWN_HOURS: int = 2
     MAX_SPREAD_POINTS_XAUUSD: int = 40
