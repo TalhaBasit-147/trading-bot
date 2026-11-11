@@ -65,6 +65,7 @@ from app.strategy.risk import RiskManager
 from app.strategy.ftmo_guard import FTMOGuard, FTMOConfig
 from app.symbols import load_symbol_configs
 from app import briefing
+from app.strategy.sizing import order_block_reason
 from app.strategy.news_filter import usd_high_impact_events
 
 
@@ -216,6 +217,8 @@ class Engine:
                 logger.info(f"Symbol {c.symbol}: strategies={','.join(c.strategies)} price_scale={c.price_scale} "
                             f"risk={c.risk_per_trade} rr_pd={c.rr_prev_day} rr_pw={c.rr_prev_week} "
                             f"max_trades/day={c.max_trades_per_day}")
+        logger.info(f"Order guard: refuse any order losing > {settings.MAX_TRADE_RISK_PCT * 100:.1f}% of equity at its stop, "
+                    f"lot caps " + ", ".join(f"{c.symbol}={c.max_lots:.2f}" for c in self.symbol_cfgs))
         if self.ftmo is not None:
             logger.info(f"FTMO GUARD ARMED — initial=${self.ftmo.cfg.initial_balance:,.0f} "
                         f"daily_stop={self.ftmo.cfg.daily_buffer_pct*100:.0f}% "
@@ -492,9 +495,21 @@ class Engine:
             risk_dist=sig.risk_dist, point=info["point"],
             tick_value=info["tick_value"],
             min_lot=info.get("min_lot", 0.01), max_lot=info.get("max_lot", 1.0),
+            lot_step=info.get("lot_step", 0.01),
         )
         if lots < info.get("min_lot", 0.01):
             logger.warning(f"[{sig.strategy}] lots too small: {lots}")
+            return
+
+        # Last-line order guard: with high account leverage the broker accepts
+        # almost any size, so refuse anything over the lot cap or the max loss.
+        cfg = self._cfg.get(sym)
+        why = order_block_reason(
+            lots, self.broker.account_equity(), sig.risk_dist, info["point"], info["tick_value"],
+            max_lots=cfg.max_lots if cfg else settings.MAX_LOTS, max_risk_pct=settings.MAX_TRADE_RISK_PCT)
+        if why:
+            logger.error(f"[{sig.strategy}] ORDER BLOCKED by risk guard: {why}")
+            self.notifier.send(f"🛑 [{sig.strategy}] {sym} order blocked: {why}")
             return
 
         # ── FTMO projected-risk check: would this trade's worst-case stop

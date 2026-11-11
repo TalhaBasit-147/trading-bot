@@ -11,6 +11,7 @@ traded. Adding a symbol is an env change:
     BTCUSD_RR_PREV_DAY=1.2
     BTCUSD_RR_PREV_WEEK=1.5
     BTCUSD_MAX_TRADES_PER_DAY=1
+    BTCUSD_MAX_LOTS=0.10              # order guard: refuse anything bigger
 
 PRICE_SCALE converts the strategies' gold-dollar constants (minimum/maximum
 stop distance, entry buffer, overshoot guard) into the symbol's own price
@@ -48,6 +49,7 @@ class SymbolConfig:
     rr_prev_day: float
     rr_prev_week: float
     max_trades_per_day: int
+    max_lots: float = 0.10
 
 
 def _env_source(env: Optional[Mapping[str, str]]) -> Dict[str, str]:
@@ -120,5 +122,9 @@ def load_symbol_configs(env: Optional[Mapping[str, str]] = None) -> List[SymbolC
         if cap < 1:
             raise SymbolConfigError(f"{sym}_MAX_TRADES_PER_DAY must be >= 1 (got {cap})")
 
-        out.append(SymbolConfig(sym, strategies, scale, risk, rr_pd, rr_pw, cap))
+        max_lots = _num(get("MAX_LOTS"), f"{sym}_MAX_LOTS", float) if get("MAX_LOTS") else settings.MAX_LOTS
+        if not (0 < max_lots <= 100):
+            raise SymbolConfigError(f"{sym}_MAX_LOTS must be in (0, 100] (got {max_lots})")
+
+        out.append(SymbolConfig(sym, strategies, scale, risk, rr_pd, rr_pw, cap, max_lots))
     return out
