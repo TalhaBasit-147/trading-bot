@@ -700,6 +700,48 @@ class Engine:
                 self._manage_split(sn)
             except Exception as e:
                 logger.exception(f"[{sn}] half_be management error: {e}")
+        try:
+            self._sweep_orphan_runners()
+        except Exception as e:
+            logger.exception(f"orphan runner sweep error: {e}")
+
+    RUNNER_SUFFIX = "_R"                 # comment suffix of every runner leg
+    RUNNER_DEADLINE_UTC = time(18, 30)   # PREV_DAY / PREV_WEEK end-of-day close
+    ORPHAN_SWEEP_SECS = 30.0
+
+    def _sweep_orphan_runners(self) -> None:
+        """A runner leg has no take-profit, so one this run is not tracking (left by
+        an earlier run, e.g. after a reboot) is closed once its end-of-day time has
+        passed, exactly as the run that opened it would have done. Untracked
+        positions WITH a take-profit are left alone, as before."""
+        now_m = time_mod.monotonic()
+        if now_m - getattr(self, "_orphan_swept_at", -1e9) < self.ORPHAN_SWEEP_SECS:
+            return
+        self._orphan_swept_at = now_m
+        tracked = set()
+        for m in self._open_positions.values():
+            tracked.add(m.get("ticket")); tracked.add(m.get("runner_ticket"))
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        for p in self.broker.open_positions():
+            if p.ticket in tracked or not (p.comment or "").endswith(self.RUNNER_SUFFIX):
+                continue
+            opened_utc = to_utc(p.open_ts, self._broker_offset)     # MT5 position time is broker clock
+            deadline = datetime.combine(opened_utc.date(), self.RUNNER_DEADLINE_UTC)
+            if opened_utc >= deadline:
+                deadline += timedelta(days=1)
+            if now_utc < deadline:
+                continue
+            logger.warning(f"Untracked runner #{p.ticket} {p.symbol} (opened {opened_utc:%Y-%m-%d %H:%M} UTC) "
+                           f"is past its {self.RUNNER_DEADLINE_UTC:%H:%M} UTC close — closing it")
+            try:
+                self.broker.close(p.ticket)
+            except Exception as e:
+                logger.error(f"closing untracked runner #{p.ticket} raised: {e}")
+            key = ("orphan_close", p.ticket)
+            if key not in getattr(self, "_orphan_alerted", set()):
+                self._orphan_alerted = getattr(self, "_orphan_alerted", set()) | {key}
+                self.notifier.send(f"🧹 Closed untracked runner #{p.ticket} {p.symbol} at its end-of-day time "
+                                   f"(left open by an earlier run)")
 
     def _try_close_leg(self, sn: str, meta: dict, ticket: int, why: str) -> None:
         """Market-close one leg, at most once per CLOSE_RETRY_SECS. Success is never
@@ -815,7 +857,8 @@ class Engine:
                  for p in orphans]
         logger.warning("Open positions from an earlier run (NOT managed by this run): " + "; ".join(lines))
         self.notifier.send("⚠️ Open positions from before this restart — they keep their broker SL/TP "
-                           "but are NOT managed (no end-of-day close, no breakeven move):\n" + "\n".join(lines))
+                           "but are NOT managed (no breakeven move; only runner legs get their "
+                           "18:30 UTC close):\n" + "\n".join(lines))
 
     def _check_closed(self, sn: str) -> None:
         meta = self._open_positions.get(sn)

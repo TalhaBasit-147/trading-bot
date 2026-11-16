@@ -353,6 +353,45 @@ def test_orphan_positions_are_reported(monkeypatch, tmp_path):
     assert "NOT managed" in _sent(eng) and "TP=none" in _sent(eng)
 
 
+def _orphan(b, comment, opened_broker_clock):
+    p = b.place_market("XAUUSD", Side.BUY, 0.01, 3990.0, None, comment=comment)
+    p.open_ts = opened_broker_clock                          # MT5 position time = broker clock (test offset +3)
+    return p.ticket
+
+
+class _FrozenNow(datetime):
+    now_utc = datetime(2026, 11, 16, 18, 29, tzinfo=timezone.utc)
+    @classmethod
+    def now(cls, tz=None):
+        return cls.now_utc
+
+
+def test_untracked_runner_is_closed_only_after_its_deadline(monkeypatch, tmp_path, clock):
+    b = FakeBroker()
+    eng, _ = _engine(monkeypatch, tmp_path, b)
+    monkeypatch.setattr(main_mod, "datetime", _FrozenNow)
+    runner = _orphan(b, "PREV_DAY_BUY_R", datetime(2026, 11, 16, 9, 5, tzinfo=timezone.utc))   # 06:05 UTC
+    target = _orphan(b, "PREV_DAY_BUY", datetime(2026, 11, 16, 9, 5, tzinfo=timezone.utc))
+    _FrozenNow.now_utc = datetime(2026, 11, 16, 18, 29, tzinfo=timezone.utc)
+    eng._manage_all_splits()
+    assert b.closes == []                                    # 18:29 UTC: not yet
+    _FrozenNow.now_utc = datetime(2026, 11, 16, 18, 31, tzinfo=timezone.utc)
+    eng._manage_all_splits()
+    assert b.closes == []                                    # rate-limited (sweep every 30 s)
+    clock["now"] += 31; eng._manage_all_splits()
+    assert b.closes == [runner] and target in b.positions    # only the TP-less runner leg
+    assert "untracked runner" in _sent(eng)
+
+
+def test_tracked_runner_is_never_swept(monkeypatch, tmp_path, clock):
+    eng, b, meta = _open_split(monkeypatch, tmp_path)
+    monkeypatch.setattr(main_mod, "datetime", _FrozenNow)
+    _FrozenNow.now_utc = datetime(2026, 11, 17, 3, 0, tzinfo=timezone.utc)
+    b.positions[meta["runner_ticket"]].open_ts = datetime(2026, 11, 16, 9, 5, tzinfo=timezone.utc)
+    clock["now"] += 100; eng._manage_all_splits()
+    assert meta["runner_ticket"] not in b.closes
+
+
 def test_management_errors_never_escape_the_loop(monkeypatch, tmp_path, clock):
     eng, b, meta = _open_split(monkeypatch, tmp_path)
     b.open_positions = lambda symbol=None: (_ for _ in ()).throw(RuntimeError("terminal gone"))
