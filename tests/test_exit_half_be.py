@@ -383,6 +383,17 @@ def test_untracked_runner_is_closed_only_after_its_deadline(monkeypatch, tmp_pat
     assert "untracked runner" in _sent(eng)
 
 
+def test_sweep_reads_the_open_time_on_the_broker_clock(monkeypatch, tmp_path, clock):
+    b = FakeBroker()
+    eng, _ = _engine(monkeypatch, tmp_path, b)
+    monkeypatch.setattr(main_mod, "datetime", _FrozenNow)
+    # 20:00 broker clock = 17:00 UTC: its deadline is 18:30 UTC the SAME day.
+    runner = _orphan(b, "PREV_WEE_SELL_R", datetime(2026, 11, 16, 20, 0, tzinfo=timezone.utc))
+    _FrozenNow.now_utc = datetime(2026, 11, 16, 18, 31, tzinfo=timezone.utc)
+    eng._manage_all_splits()
+    assert b.closes == [runner]
+
+
 def test_tracked_runner_is_never_swept(monkeypatch, tmp_path, clock):
     eng, b, meta = _open_split(monkeypatch, tmp_path)
     monkeypatch.setattr(main_mod, "datetime", _FrozenNow)
