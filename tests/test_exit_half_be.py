@@ -270,8 +270,10 @@ def test_refused_breakeven_is_retried_then_runner_closed(monkeypatch, tmp_path, 
 def test_target_leg_stopped_closes_the_runner(monkeypatch, tmp_path, clock):
     eng, b, meta = _open_split(monkeypatch, tmp_path)
     b.hit(meta["ticket"], -10.0)
+    b.bid, b.ask = 4012.3, 4012.5        # even with price far in profit, a lost target leg ends the trade
     eng._tick()
-    assert meta["runner_ticket"] in b.closes and not [m for m in b.modifies if m[1] == pytest.approx(4000.2)]
+    assert meta["runner_ticket"] in b.closes
+    assert not [m for m in b.modifies if m[1] == pytest.approx(4000.2)]   # no breakeven move
 
 
 def test_trade_is_booked_once_with_both_legs_pnl(monkeypatch, tmp_path, clock):
@@ -280,7 +282,9 @@ def test_trade_is_booked_once_with_both_legs_pnl(monkeypatch, tmp_path, clock):
     real = eng._record_close
     eng._record_close = lambda sn, t, pnl, bar: (booked.append((sn, t, pnl)), real(sn, t, pnl, bar))
     b.hit(meta["ticket"], +12.0); b.bid, b.ask = 4012.3, 4012.5
-    eng._tick()
+    for _ in range(eng.PNL_WAIT_PASSES + 5):                 # runner keeps riding: nothing is booked
+        eng._tick()
+    assert booked == [] and "PREV_DAY_BREAKOUT" in eng._open_positions
     b.hit(meta["runner_ticket"], +25.0)
     eng._tick(); eng._tick()
     assert booked == [("PREV_DAY_BREAKOUT", meta["ticket"], pytest.approx(37.0))]
