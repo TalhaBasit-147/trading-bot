@@ -12,6 +12,7 @@ traded. Adding a symbol is an env change:
     BTCUSD_RR_PREV_WEEK=1.5
     BTCUSD_MAX_TRADES_PER_DAY=1
     BTCUSD_MAX_LOTS=0.10              # order guard: refuse anything bigger
+    BTCUSD_EXIT_MODE=half_be          # fixed (default) | half_be, see app/strategy/exits.py
 
 PRICE_SCALE converts the strategies' gold-dollar constants (minimum/maximum
 stop distance, entry buffer, overshoot guard) into the symbol's own price
@@ -31,6 +32,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Tuple
 
 from app.config import settings
+from app.strategy.exits import EXIT_MODES, FIXED, normalize_exit_mode
 
 KNOWN_STRATEGIES: Tuple[str, ...] = ("PREV_DAY", "PREV_WEEK")
 PREV_WEEK_DEFAULT_RR = 1.5
@@ -50,6 +52,7 @@ class SymbolConfig:
     rr_prev_week: float
     max_trades_per_day: int
     max_lots: float = 0.10
+    exit_mode: str = "fixed"
 
 
 def _env_source(env: Optional[Mapping[str, str]]) -> Dict[str, str]:
@@ -126,5 +129,10 @@ def load_symbol_configs(env: Optional[Mapping[str, str]] = None) -> List[SymbolC
         if not (0 < max_lots <= 100):
             raise SymbolConfigError(f"{sym}_MAX_LOTS must be in (0, 100] (got {max_lots})")
 
-        out.append(SymbolConfig(sym, strategies, scale, risk, rr_pd, rr_pw, cap, max_lots))
+        exit_raw = get("EXIT_MODE") or (src.get("EXIT_MODE") if env is not None else settings.EXIT_MODE) or FIXED
+        exit_mode = normalize_exit_mode(exit_raw)
+        if exit_mode is None:
+            raise SymbolConfigError(f"{sym}_EXIT_MODE / EXIT_MODE={exit_raw!r}: use one of {', '.join(EXIT_MODES)}")
+
+        out.append(SymbolConfig(sym, strategies, scale, risk, rr_pd, rr_pw, cap, max_lots, exit_mode))
     return out

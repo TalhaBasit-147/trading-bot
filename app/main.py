@@ -66,6 +66,7 @@ from app.strategy.ftmo_guard import FTMOGuard, FTMOConfig
 from app.symbols import load_symbol_configs
 from app import briefing
 from app.strategy.sizing import order_block_reason
+from app.strategy.exits import HALF_BE, split_lots
 from app.strategy.news_filter import usd_high_impact_events
 
 
@@ -216,7 +217,16 @@ class Engine:
             for c in self.symbol_cfgs:
                 logger.info(f"Symbol {c.symbol}: strategies={','.join(c.strategies)} price_scale={c.price_scale} "
                             f"risk={c.risk_per_trade} rr_pd={c.rr_prev_day} rr_pw={c.rr_prev_week} "
-                            f"max_trades/day={c.max_trades_per_day}")
+                            f"max_trades/day={c.max_trades_per_day} exit={c.exit_mode}")
+        else:
+            logger.info(f"Exit mode: {self.symbol_cfgs[0].exit_mode}")
+        if any(c.exit_mode == HALF_BE for c in self.symbol_cfgs):
+            try:
+                hedging = self.broker.can_hold_split_positions()
+            except Exception:
+                hedging = False
+            logger.info(f"half_be exit: account hedging={hedging}"
+                        + ("" if hedging else " — every trade will use the fixed target instead"))
         logger.info(f"Order guard: refuse any order losing > {settings.MAX_TRADE_RISK_PCT * 100:.1f}% of equity at its stop, "
                     f"lot caps " + ", ".join(f"{c.symbol}={c.max_lots:.2f}" for c in self.symbol_cfgs))
         if self.ftmo is not None:
@@ -228,6 +238,7 @@ class Engine:
                                f"account, stop at {self.ftmo.cfg.daily_buffer_pct*100:.0f}% daily / "
                                f"{self.ftmo.cfg.max_buffer_pct*100:.0f}% overall")
         self._ensure_symbol()
+        self._report_orphans()
 
         while not self._stop.is_set():
             try:
@@ -287,6 +298,9 @@ class Engine:
                 self.risk.pause("kill switch")
                 self.notifier.send("🔴 Kill switch activated")
             return
+
+        # half_be trades: react to the target leg banking within seconds, not on the next bar.
+        self._manage_all_splits()
 
         # Each symbol has its own chart: process every symbol that has a new
         # closed M1 bar. Symbols are independent; one without data is skipped.
@@ -526,8 +540,12 @@ class Engine:
                 logger.warning(f"[{sig.strategy}] FTMO risk check failed, skipping trade: {e}")
                 return
 
+        # half_be exit: split into a target leg + a runner leg (None = one fixed position).
+        legs = self._plan_split(sig.strategy, sym, lots, info)
+        first_lots = legs[0] if legs else lots
+
         pos = self.broker.place_market(
-            sym, sig.side, lots, sig.sl, sig.tp,
+            sym, sig.side, first_lots, sig.sl, sig.tp,
             comment=f"{sig.strategy[:8]}_{sig.side.value}",
         )
         if pos is None or pos.ticket is None:
@@ -569,12 +587,31 @@ class Engine:
         except Exception as e:
             logger.warning(f"[{sig.strategy}] SL/TP re-anchor failed: {e}")
 
-        risk_ccy = (sig.risk_dist / info["point"]) * info["tick_value"] * lots
+        runner = self._open_runner_leg(sig, sym, legs[1], info) if legs else None
+        placed_lots = first_lots + (runner["lots"] if runner else 0.0)
+
+        risk_ccy = (sig.risk_dist / info["point"]) * info["tick_value"] * placed_lots
         self._open_positions[sig.strategy] = {
-            "ticket": pos.ticket, "signal": sig, "lots": lots,
+            "ticket": pos.ticket, "signal": sig, "lots": placed_lots,
             "entry": pos.entry, "risk_ccy": max(risk_ccy, 1e-9),
             "symbol": sym,
         }
+        if runner:
+            self._open_positions[sig.strategy].update({
+                "exit_mode": HALF_BE,
+                "target_lots": first_lots,
+                "runner_ticket": runner["ticket"],
+                "runner_lots": runner["lots"],
+                "runner_entry": runner["entry"],
+                "runner_protected": False,     # stop moved to breakeven (or runner closed)
+                "must_close": set(),           # tickets the engine has decided to close
+                "last_close_try": {},          # ticket -> monotonic time of last close attempt
+                "first_close_try": {},         # ticket -> monotonic time of first close attempt
+                "be_tries": 0,                 # failed breakeven modifies while price allowed it
+                "pnl_wait": 0,                 # passes spent waiting for deal history
+                "alerted": set(),              # one-shot alert keys
+            })
+        lots = placed_lots
         st = self._sym[sym]
         st.trades_today += 1
         if st.last_outcome_today == "LOSS":
@@ -584,19 +621,208 @@ class Engine:
         if self.ftmo is not None:
             self.ftmo.record_trade_day()
 
+        split_txt = (f"\nExit: half_be — {first_lots} lots target #{pos.ticket}, "
+                     f"{runner['lots']} lots runner #{runner['ticket']} (no TP)" if runner else "")
         self.notifier.send(
-            f"📥 *[{sig.strategy}]* {sig.side.value} `{sym}` {lots} lots\n"
+            f"📥 *[{sig.strategy}]* {sig.side.value} `{sym}` {lots:.2f} lots\n"
             f"Entry: `{pos.entry:.2f}` SL: `{sig.sl:.2f}` TP: `{sig.tp:.2f}`\n"
-            f"Risk: `${risk_ccy:.2f}` | {sig.note}"
+            f"Risk: `${risk_ccy:.2f}` | {sig.note}{split_txt}"
         )
         logger.info(
-            f"[{sig.strategy}] ENTRY {sig.side.value} {lots} lots @ {pos.entry:.2f} "
+            f"[{sig.strategy}] ENTRY {sig.side.value} {lots:.2f} lots @ {pos.entry:.2f} "
             f"SL={sig.sl:.2f} TP={sig.tp:.2f} risk=${risk_ccy:.2f} | {sig.note}"
+            + (f" | half_be target #{pos.ticket} {first_lots} lots, runner #{runner['ticket']} "
+               f"{runner['lots']} lots @ {runner['entry']:.2f} SL={runner['sl']:.2f} no TP" if runner else "")
         )
+
+    # ── half_be exit mode (see app/strategy/exits.py) ──────────────────────
+    CLOSE_RETRY_SECS = 10.0      # min gap between close attempts on one ticket
+    PNL_WAIT_PASSES = 20         # passes to wait for deal history before booking the known part
+    BE_GAP_POINTS = 10           # price must be this far past the runner entry to set a BE stop
+    BE_MAX_TRIES = 5             # refused breakeven modifies (price allowing it) before closing instead
+
+    def _plan_split(self, sn: str, sym: str, lots: float, info: dict):
+        """(target_lots, runner_lots) if this trade should use half_be, else None."""
+        cfg = self._cfg.get(sym)
+        if cfg is None or cfg.exit_mode != HALF_BE:
+            return None
+        try:
+            hedging = self.broker.can_hold_split_positions()
+        except Exception as e:
+            logger.warning(f"[{sn}] half_be: account mode unreadable ({e}) — using fixed target")
+            return None
+        if not hedging:
+            logger.warning(f"[{sn}] half_be: account cannot hold two positions (not hedging) — using fixed target")
+            return None
+        legs = split_lots(lots, info.get("min_lot", 0.01), info.get("lot_step", 0.01))
+        if legs is None:
+            logger.info(f"[{sn}] half_be: {lots} lots is too small to split — using fixed target")
+        return legs
+
+    def _open_runner_leg(self, sig, sym: str, runner_lots: float, info: dict) -> Optional[dict]:
+        """Open the runner leg: same side and stop distance, NO take-profit. Its stop
+        is re-anchored to its own fill. Returns None (target leg trades alone, at
+        reduced size) if the order fails."""
+        try:
+            pos = self.broker.place_market(
+                sym, sig.side, runner_lots, sig.sl, None,
+                comment=f"{sig.strategy[:8]}_{sig.side.value}_R",
+            )
+        except Exception as e:
+            logger.exception(f"[{sig.strategy}] runner leg order raised: {e}")
+            pos = None
+        if pos is None or pos.ticket is None:
+            logger.error(f"[{sig.strategy}] half_be runner leg rejected — trading the target leg alone")
+            self.notifier.send(f"⚠️ [{sig.strategy}] {sym} runner leg rejected; only the target half is open")
+            return None
+        # The order went out with the target leg's stop (sig.sl). Re-anchor it to the
+        # runner's own fill so the runner risks exactly risk_dist, with the same
+        # implausible-fill guard as the target leg.
+        sl = sig.sl
+        try:
+            sane = pos.entry > 0.0 and abs(pos.entry - sig.entry) <= max(sig.risk_dist * 0.5, info["point"] * 50)
+            if not sane:
+                logger.warning(f"[{sig.strategy}] runner fill implausible ({pos.entry}); keeping its original stop")
+            else:
+                own_sl = pos.entry - sig.risk_dist if sig.side == Side.BUY else pos.entry + sig.risk_dist
+                if abs(own_sl - sig.sl) > info["point"] * 2 and self.broker.modify_sl_tp(pos.ticket, own_sl, None):
+                    sl = own_sl
+        except Exception as e:
+            logger.warning(f"[{sig.strategy}] runner SL re-anchor failed: {e}")
+        entry = pos.entry if pos.entry > 0.0 else sig.entry
+        return {"ticket": pos.ticket, "lots": runner_lots, "entry": entry, "sl": sl}
+
+    def _manage_all_splits(self) -> None:
+        """Called every engine loop (~1 s) so the runner is protected within seconds
+        of the target banking. Never lets an error escape into the trading loop."""
+        for sn in [k for k, m in self._open_positions.items() if m.get("runner_ticket")]:
+            try:
+                self._manage_split(sn)
+            except Exception as e:
+                logger.exception(f"[{sn}] half_be management error: {e}")
+
+    def _try_close_leg(self, sn: str, meta: dict, ticket: int, why: str) -> None:
+        """Market-close one leg, at most once per CLOSE_RETRY_SECS. Success is never
+        assumed: the next pass checks the broker and tries again if it is still open,
+        and alerts once if it stays open for over a minute."""
+        now = time_mod.monotonic()
+        first = meta["first_close_try"].setdefault(ticket, now)
+        if now - first > 60 and ("stuck", ticket) not in meta["alerted"]:
+            meta["alerted"].add(("stuck", ticket))
+            logger.error(f"[{sn}] #{ticket} still open {now - first:.0f}s after the first close attempt")
+            self.notifier.send(f"🔴 [{sn}] {meta['symbol']} position #{ticket} will not close — check MT5")
+        if now - meta["last_close_try"].get(ticket, -1e9) < self.CLOSE_RETRY_SECS:
+            return
+        meta["last_close_try"][ticket] = now
+        logger.info(f"[{sn}] closing #{ticket}: {why}")
+        try:
+            self.broker.close(ticket)
+        except Exception as e:
+            logger.error(f"[{sn}] close #{ticket} raised: {e}")
+
+    def _manage_split(self, sn: str) -> None:
+        meta = self._open_positions.get(sn)
+        if not meta or not meta.get("runner_ticket"):
+            return
+        sym = meta["symbol"]
+        t_ticket, r_ticket = meta["ticket"], meta["runner_ticket"]
+        open_now = {p.ticket for p in self.broker.open_positions(sym)}
+        t_open, r_open = t_ticket in open_now, r_ticket in open_now
+
+        # 1) Legs the engine decided to close (EOD, target leg lost, BE impossible): keep trying.
+        for t in list(meta["must_close"]):
+            if t in open_now:
+                self._try_close_leg(sn, meta, t, "pending close")
+            else:
+                meta["must_close"].discard(t)
+
+        # 2) Target leg gone while the runner is still open and unprotected.
+        if not t_open and r_open and not meta["runner_protected"] and r_ticket not in meta["must_close"]:
+            t_pnl = self.broker.realized_pnl(t_ticket)
+            if t_pnl is not None and t_pnl <= 0:
+                meta["runner_protected"] = True
+                meta["must_close"].add(r_ticket)
+                logger.info(f"[{sn}] target leg #{t_ticket} closed at ${t_pnl:+.2f} — closing runner #{r_ticket}")
+                self._try_close_leg(sn, meta, r_ticket, "target leg did not bank")
+            else:
+                # Banked (or unknown): protect the runner at breakeven, never add risk.
+                self._protect_runner(sn, meta, t_pnl)
+
+        # 3) Both legs gone: book the trade once, from broker deal history.
+        if not t_open and not r_open:
+            parts = [self.broker.realized_pnl(t_ticket), self.broker.realized_pnl(r_ticket)]
+            if any(p is None for p in parts) and meta["pnl_wait"] < self.PNL_WAIT_PASSES:
+                meta["pnl_wait"] += 1
+                return
+            if any(p is None for p in parts):
+                logger.warning(f"[{sn}] realized P/L unavailable for a leg {parts}; booking the known part only")
+            self._record_close(sn, t_ticket, sum(p for p in parts if p is not None), None)
+
+    def _protect_runner(self, sn: str, meta: dict, t_pnl: Optional[float]) -> None:
+        sym, r_ticket, sig = meta["symbol"], meta["runner_ticket"], meta["signal"]
+        be = meta["runner_entry"]
+        info = self.broker.symbol_info(sym)
+        tick = self.broker.tick(sym)
+        gap = info["point"] * self.BE_GAP_POINTS
+        # The exit side of the book: a BUY runner closes on the bid, a SELL on the ask.
+        valid = (tick["bid"] > be + gap) if sig.side == Side.BUY else (tick["ask"] < be - gap)
+        banked = f" (${t_pnl:+.2f})" if t_pnl is not None else ""
+        if valid:
+            if self.broker.modify_sl_tp(r_ticket, be, None):
+                meta["runner_protected"] = True
+                logger.info(f"[{sn}] target leg #{meta['ticket']} banked{banked} — "
+                            f"runner #{r_ticket} stop moved to breakeven {be:.2f}")
+                self.notifier.send(f"🎯 [{sn}] {sym} target half banked{banked}. "
+                                   f"Runner stop → breakeven `{be:.2f}`; it rides to end of day.")
+                return
+            meta["be_tries"] += 1
+            if meta["be_tries"] < self.BE_MAX_TRIES:
+                logger.warning(f"[{sn}] breakeven modify on #{r_ticket} refused "
+                               f"({meta['be_tries']}/{self.BE_MAX_TRIES}); retrying")
+                return
+        # Price is at/through breakeven, or the broker keeps refusing: exit the runner now.
+        meta["runner_protected"] = True
+        meta["must_close"].add(r_ticket)
+        logger.info(f"[{sn}] target leg banked{banked}; runner #{r_ticket} breakeven stop not placeable "
+                    f"(bid={tick['bid']} ask={tick['ask']} be={be:.2f}) — closing at market")
+        self.notifier.send(f"🎯 [{sn}] {sym} target half banked{banked}; runner closed at market "
+                           f"(price was already back at breakeven)")
+        self._try_close_leg(sn, meta, r_ticket, "breakeven not placeable")
+
+    def _close_split_eod(self, sn: str) -> None:
+        meta = self._open_positions.get(sn)
+        if not meta:
+            return
+        open_now = {p.ticket for p in self.broker.open_positions(meta["symbol"])}
+        for t in (meta["ticket"], meta["runner_ticket"]):
+            if t in open_now and t not in meta["must_close"]:
+                logger.info(f"[{sn}] end of day — closing #{t}")
+                meta["must_close"].add(t)
+        meta["runner_protected"] = True
+        self._manage_split(sn)
+
+    def _report_orphans(self) -> None:
+        """Positions with this bot's magic that exist at startup belong to an earlier
+        run; this run does not manage them (no end-of-day close, no breakeven move)."""
+        try:
+            orphans = self.broker.open_positions()
+        except Exception as e:
+            logger.warning(f"orphan check failed: {e}")
+            return
+        if not orphans:
+            return
+        lines = [f"#{p.ticket} {p.symbol} {p.side.value} {p.qty} @ {p.entry} SL={p.sl} TP={p.tp or 'none'}"
+                 for p in orphans]
+        logger.warning("Open positions from an earlier run (NOT managed by this run): " + "; ".join(lines))
+        self.notifier.send("⚠️ Open positions from before this restart — they keep their broker SL/TP "
+                           "but are NOT managed (no end-of-day close, no breakeven move):\n" + "\n".join(lines))
 
     def _check_closed(self, sn: str) -> None:
         meta = self._open_positions.get(sn)
         if not meta: return
+        if meta.get("runner_ticket"):
+            self._manage_split(sn)
+            return
         sym = meta.get("symbol", self.symbol)
         if meta["ticket"] not in {p.ticket for p in self.broker.open_positions(sym)}:
             # Source of truth: realized P/L from broker deal history. Only if
@@ -623,6 +849,9 @@ class Engine:
     def _force_close(self, sn: str, bar: Bar) -> None:
         meta = self._open_positions.get(sn)
         if not meta: return
+        if meta.get("runner_ticket"):
+            self._close_split_eod(sn)
+            return
         logger.info(f"[{sn}] Force closing #{meta['ticket']} at EOD")
         pnl = self.broker.close(meta["ticket"])
         # Prefer the realized figure from deal history (includes the closing

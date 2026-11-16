@@ -183,7 +183,21 @@ class MT5Broker(Broker):
     #         ticket=result.order, comment=comment,
     #     )
 
-    def place_market(self, symbol: str, side: Side, lots: float, sl: float, tp: float, comment: str = "") -> Optional[Position]:
+    def can_hold_split_positions(self) -> bool:
+        """Only a retail HEDGING account keeps two same-direction positions apart;
+        on a netting account a second order would merge into the first."""
+        try:
+            acc = mt5.account_info()  # type: ignore
+            hedging = getattr(mt5, "ACCOUNT_MARGIN_MODE_RETAIL_HEDGING", 2)
+            return acc is not None and int(acc.margin_mode) == int(hedging)
+        except Exception as e:
+            logger.warning(f"[MT5] could not read account margin mode: {e}")
+            return False
+
+    def place_market(self, symbol: str, side: Side, lots: float, sl: float, tp: Optional[float], comment: str = "") -> Optional[Position]:
+        """Market order with a broker-side stop. `tp=None` (or <= 0) sends the
+        order WITHOUT a take-profit (the half_be runner leg); any positive `tp`
+        is validated against the broker's minimum distance as before."""
         info_raw = mt5.symbol_info(symbol)  # type: ignore
         if info_raw is None:
             mt5.symbol_select(symbol, True)  # type: ignore
@@ -206,7 +220,11 @@ class MT5Broker(Broker):
         min_dist += 5 * point
 
         sl = float(sl)
-        tp = float(tp)
+        # No take-profit requested -> send 0.0, which MT5 reads as "no TP". It must
+        # never go through the clamp below, which would turn 0 into a TP right
+        # next to the price and close the runner almost immediately.
+        has_tp = tp is not None and float(tp) > 0.0
+        tp = float(tp) if has_tp else 0.0
 
         if side == Side.BUY:
             # SL must be below price by at least min_dist; TP above by at least min_dist
@@ -216,7 +234,7 @@ class MT5Broker(Broker):
                                f"adjusting to {max_sl:.{digits}f} (min_dist={min_dist})")
                 sl = max_sl
             min_tp = price + min_dist
-            if tp < min_tp:
+            if has_tp and tp < min_tp:
                 tp = min_tp
         else:
             # SELL: SL must be above price by at least min_dist; TP below
@@ -226,12 +244,12 @@ class MT5Broker(Broker):
                                f"adjusting to {min_sl:.{digits}f} (min_dist={min_dist})")
                 sl = min_sl
             max_tp = price - min_dist
-            if tp > max_tp:
+            if has_tp and tp > max_tp:
                 tp = max_tp
 
         # Round to digits
         sl = round(sl, digits)
-        tp = round(tp, digits)
+        tp = round(tp, digits) if has_tp else 0.0
         price = round(float(price), digits)
 
         request = {
@@ -366,9 +384,12 @@ class MT5Broker(Broker):
             logger.warning(f"[MT5] realized_pnl failed for #{ticket}: {e}")
             return None
 
-    def modify_sl_tp(self, ticket: int, sl: float, tp: float) -> bool:
+    def modify_sl_tp(self, ticket: int, sl: float, tp: Optional[float]) -> bool:
         """Modify SL/TP of an open position. Returns True on success.
-        Used to re-anchor TP to the actual fill price after slippage."""
+        Used to re-anchor TP to the actual fill price after slippage, and to move
+        a half_be runner's stop to breakeven. `tp=None` (or <= 0) = no TP."""
+        if tp is None or float(tp) <= 0.0:
+            tp = 0.0
         positions = mt5.positions_get(ticket=ticket)  # type: ignore
         if not positions:
             logger.warning(f"[MT5] modify_sl_tp: position #{ticket} not found")

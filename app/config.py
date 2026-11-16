@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     # leverage the broker no longer rejects an absurd size, so the bot must.
     MAX_TRADE_RISK_PCT: float = 0.05
     MAX_LOTS: float = 0.10
+    # How a live trade is exited (app/strategy/exits.py); per symbol: <SYM>_EXIT_MODE.
+    #   fixed   - one position, broker stop + target (the original behaviour).
+    #   half_be - two positions: half takes the target, the other half has no target;
+    #             when the target half banks, the runner's stop moves to its entry and
+    #             it is closed at the strategy's end-of-day time. Falls back to `fixed`
+    #             when the trade is too small to split or the account cannot hedge.
+    EXIT_MODE: str = "fixed"
     MIN_RR: float = 1.0
     CONSEC_LOSS_COOLDOWN_HOURS: int = 2
     MAX_SPREAD_POINTS_XAUUSD: int = 40

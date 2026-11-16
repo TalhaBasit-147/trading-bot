@@ -43,6 +43,13 @@ class Broker(ABC):
     @abstractmethod
     def open_positions(self, symbol: Optional[str] = None) -> List[Position]: ...
 
+    def can_hold_split_positions(self) -> bool:
+        """True if this broker can hold two separate positions on one symbol in
+        the same direction and manage them independently (an MT5 *hedging*
+        account). Used by the half_be exit mode, which falls back to a single
+        fixed-target position when this is False. Default: False (safe)."""
+        return False
+
     def realized_pnl(self, ticket: int) -> Optional[float]:
         """Realized net P/L for a closed position from broker history.
 
