@@ -64,6 +64,7 @@ def rebuild_day(deals: List[dict]) -> Dict[str, SymbolDay]:
                 parent = _Trade(symbol=d["symbol"], opened=d["time"])
                 trades.append(parent)
             parent.positions.add(pos)
+            parent.pnl += float(d.get("pnl") or 0.0)     # entry commission is part of the result
             by_position[pos] = parent
         elif d["kind"] == "out":
             t = by_position.get(pos)

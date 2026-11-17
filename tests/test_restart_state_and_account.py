@@ -53,6 +53,11 @@ def test_unlinked_runner_counts_as_its_own_trade_and_old_positions_are_ignored()
     assert d["XAUUSD"].trades == 2 and d["XAUUSD"].last_outcome is None
 
 
+def test_entry_commission_counts_toward_the_outcome():
+    d = rebuild_day([D(5, 0, "XAUUSD", 1, "in", -0.04), D(6, 0, "XAUUSD", 1, "out", 0.02)])
+    assert d["XAUUSD"].last_outcome == "LOSS" and d["XAUUSD"].closes[0][1] == pytest.approx(-0.02)
+
+
 def test_symbols_are_independent():
     d = rebuild_day([D(5, 0, "XAUUSD", 1, "in"), D(6, 0, "XAUUSD", 1, "out", -10),
                      D(7, 0, "BTCUSD", 2, "in")])
