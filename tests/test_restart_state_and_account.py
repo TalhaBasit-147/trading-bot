@@ -200,6 +200,19 @@ def test_telegram_label_prefix():
     assert Telegram(token="t", chat_id="c", label="").format("hi") == "hi"
 
 
+def test_telegram_send_applies_the_label(monkeypatch):
+    import app.notify.telegram as tg
+    posted = []
+    class _Client:
+        def __init__(self, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, url, data): posted.append(data)
+    monkeypatch.setattr(tg.httpx, "Client", _Client)
+    Telegram(token="t", chat_id="c", label="LIVE").send("trade opened")
+    assert posted[0]["text"] == "LIVE | trade opened"
+
+
 def test_main_alerts_when_broker_refuses(monkeypatch):
     sent = []
     broker = MagicMock(); broker.connect.return_value = False
