@@ -67,6 +67,7 @@ from app.symbols import load_symbol_configs
 from app import briefing
 from app.strategy.sizing import order_block_reason
 from app.strategy.exits import HALF_BE, split_lots
+from app.strategy.daily_state import rebuild_day
 from app.strategy.news_filter import usd_high_impact_events
 
 
@@ -238,6 +239,7 @@ class Engine:
                                f"account, stop at {self.ftmo.cfg.daily_buffer_pct*100:.0f}% daily / "
                                f"{self.ftmo.cfg.max_buffer_pct*100:.0f}% overall")
         self._ensure_symbol()
+        self._restore_daily_state()
         self._report_orphans()
 
         while not self._stop.is_set():
@@ -292,7 +294,86 @@ class Engine:
     def _open_count(self, symbol: str) -> int:
         return sum(1 for m in self._open_positions.values() if m.get("symbol", self.symbol) == symbol)
 
+    def _restore_daily_state(self) -> None:
+        """After a restart, rebuild today's per-symbol trade count, last outcome and
+        recovery slot (and the account-wide daily stats) from broker deal history,
+        so a restart can never hand a symbol an extra trade. Fails open to the old
+        behaviour (fresh day) only if the history cannot be read, and says so."""
+        try:
+            deals = self.broker.deals_today(self.symbols)
+        except Exception as e:
+            logger.error(f"Daily state NOT restored (history unreadable: {e}) — treating today as fresh")
+            self.notifier.send(f"⚠️ Could not read today's trade history after restart ({e}); "
+                               f"daily trade limits start from zero")
+            return
+        if not deals:
+            logger.info("Daily state: no trades by this bot today in broker history")
+            return
+        day = deals[0]["time"].strftime("%Y-%m-%d")         # broker day, the engine's day key
+        replay = rebuild_day(deals)
+        lines = []
+        for sym, d in replay.items():
+            st = self._sym.get(sym)
+            if st is None:
+                continue
+            st.current_day = day
+            st.trades_today = d.trades
+            st.last_outcome_today = d.last_outcome
+            st.recovery_trade_taken = d.recovery_taken
+            lines.append(f"{sym}: {d.trades} trade(s), last={d.last_outcome or '-'}, "
+                         f"recovery_used={d.recovery_taken}, still_open={d.open_trades}")
+        for sym, st in self._sym.items():          # symbols with no trade today: same day key, zero counts
+            if sym not in replay:
+                st.current_day = day
+        # Account-wide daily stats (single-symbol mode gates on these).
+        self._risk_day = day
+        eq = self.broker.account_equity()
+        self.risk.on_new_day(eq)
+        realized = 0.0
+        for d in replay.values():
+            self.risk.state.daily.trades += d.trades
+        for exit_ts, pnl in sorted((c for d in replay.values() for c in d.closes), key=lambda c: c[0]):
+            realized += pnl
+            self.risk.record_trade_close(pnl, now=to_utc(exit_ts, self._broker_offset).replace(tzinfo=timezone.utc))
+        self.risk.state.open_positions = 0
+        try:
+            bal = self.broker.account_balance()
+            if bal and bal > 0:
+                self.risk.state.equity_start_of_day = bal - realized
+        except Exception:
+            pass
+        self.risk.sync_equity(eq)
+        msg = f"Daily state restored from broker history ({day}): " + "; ".join(lines)
+        logger.info(msg)
+        self.notifier.send("♻️ " + msg)
+
+    ACCOUNT_CHECK_SECS = 5.0
+
+    def _account_ok(self) -> bool:
+        """False while the terminal is on an account other than MT5_EXPECTED_LOGIN.
+        Then the whole tick is skipped (no entries AND no position management: on a
+        foreign account the bot's tickets would look closed and be mis-booked)."""
+        now = time_mod.monotonic()
+        if now - getattr(self, "_acct_checked_at", -1e9) < self.ACCOUNT_CHECK_SECS:
+            return getattr(self, "_acct_ok", True)
+        self._acct_checked_at = now
+        try:
+            why = self.broker.wrong_account_reason()
+        except Exception as e:
+            why = f"account check failed: {e}"
+        was_ok = getattr(self, "_acct_ok", True)
+        self._acct_ok = why is None
+        if why and was_ok:
+            logger.error(f"WRONG ACCOUNT — trading and position management suspended: {why}")
+            self.notifier.send(f"🔴 WRONG ACCOUNT — bot suspended: {why}")
+        elif not why and not was_ok:
+            logger.warning("Account check OK again — resuming")
+            self.notifier.send("🟢 Account check OK again — bot resumed")
+        return self._acct_ok
+
     def _tick(self) -> None:
+        if not self._account_ok():
+            return
         if os.path.exists(KILL_FILE):
             if not self.risk.state.paused:
                 self.risk.pause("kill switch")
@@ -942,11 +1023,12 @@ def main() -> None:
     logger.info(f"Starting ORB Bot v2 — MODE={settings.MODE}")
 
     broker = _make_broker()
+    notifier = Telegram()
     if not broker.connect():
         logger.error("Broker connection failed.")
+        notifier.send("🔴 Bot NOT started: broker connection failed or wrong account (see log)")
         return
 
-    notifier = Telegram()
     engine   = Engine(broker, notifier)
 
     threading.Thread(target=_run_api, daemon=True, name="api").start()

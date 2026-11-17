@@ -9,7 +9,7 @@ single reconnect; repeated failures trigger an upstream pause via the engine.
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from loguru import logger
@@ -57,6 +57,8 @@ class MT5Broker(Broker):
         kwargs = {}
         if settings.MT5_PATH:
             kwargs["path"] = settings.MT5_PATH
+            if settings.MT5_PORTABLE:
+                kwargs["portable"] = True
         if not mt5.initialize(**kwargs):  # type: ignore[attr-defined]
             logger.error(f"mt5.initialize failed: {mt5.last_error()}")  # type: ignore
             return False
@@ -69,10 +71,74 @@ class MT5Broker(Broker):
             if not ok:
                 logger.error(f"mt5.login failed: {mt5.last_error()}")  # type: ignore
                 return False
-        self._connected = True
         acc = mt5.account_info()  # type: ignore
-        logger.info(f"MT5 connected. account={getattr(acc, 'login', '?')} server={getattr(acc, 'server', '?')} equity={getattr(acc, 'equity', '?')}")
+        why = self.wrong_account_reason()
+        if why:
+            # Never trade an account this bot was not configured for (two terminals
+            # on one machine: attaching to the other one must be impossible).
+            logger.error(f"MT5 REFUSED: {why}")
+            mt5.shutdown()  # type: ignore
+            return False
+        self._connected = True
+        info = mt5.terminal_info()  # type: ignore
+        logger.info(f"MT5 connected. account={getattr(acc, 'login', '?')} server={getattr(acc, 'server', '?')} "
+                    f"equity={getattr(acc, 'equity', '?')} terminal={getattr(info, 'path', '?')}")
+        if settings.MODE == "live" and not settings.MT5_EXPECTED_LOGIN:
+            logger.warning("MT5_EXPECTED_LOGIN is not set: the bot will trade whatever account the terminal is on")
         return True
+
+    def account_login(self) -> Optional[int]:
+        acc = mt5.account_info()  # type: ignore
+        return int(acc.login) if acc is not None else None
+
+    def wrong_account_reason(self) -> Optional[str]:
+        """None if the connected account is the configured MT5_EXPECTED_LOGIN (or no
+        expectation is configured); otherwise why trading must not happen."""
+        if not settings.MT5_EXPECTED_LOGIN:
+            return None
+        try:
+            login = self.account_login()
+        except Exception as e:
+            return f"account unreadable ({e})"
+        if login is None:
+            return "account unreadable (terminal not logged in?)"
+        if int(login) != int(settings.MT5_EXPECTED_LOGIN):
+            return f"terminal is on account {login}, but this bot is configured for {settings.MT5_EXPECTED_LOGIN}"
+        return None
+
+    def deals_today(self, symbols: List[str]) -> List[dict]:
+        """This bot's deals since 00:00 of the current BROKER day (the engine's day
+        key), oldest first. Used to rebuild the daily trade state after a restart.
+        Times are broker clock, naive. Returns [] if the history is unreadable."""
+        try:
+            ticks = [mt5.symbol_info_tick(s) for s in symbols]  # type: ignore
+            stamps = [int(t.time) for t in ticks if t is not None and getattr(t, "time", 0)]
+            if not stamps:
+                return []
+            now_b = datetime.fromtimestamp(max(stamps), tz=timezone.utc)      # broker clock as UTC-aware
+            day_start = now_b.replace(hour=0, minute=0, second=0, microsecond=0)
+            deals = mt5.history_deals_get(day_start, now_b + timedelta(days=1))  # type: ignore
+        except Exception as e:
+            logger.warning(f"[MT5] deals_today failed: {e}")
+            return []
+        out = []
+        for d in deals or []:
+            if getattr(d, "magic", None) != self._magic:
+                continue
+            entry = getattr(d, "entry", None)
+            kind = ("in" if entry == getattr(mt5, "DEAL_ENTRY_IN", 0)
+                    else "out" if entry in (getattr(mt5, "DEAL_ENTRY_OUT", 1), getattr(mt5, "DEAL_ENTRY_OUT_BY", 4))
+                    else None)
+            if kind is None:
+                continue
+            out.append({
+                "time": datetime.fromtimestamp(int(d.time), tz=timezone.utc).replace(tzinfo=None),
+                "symbol": d.symbol, "position": int(d.position_id), "kind": kind,
+                "comment": d.comment or "",
+                "pnl": float(d.profit or 0.0) + float(d.commission or 0.0) + float(d.swap or 0.0),
+            })
+        out.sort(key=lambda x: x["time"])
+        return out
 
     def disconnect(self) -> None:
         if MT5_AVAILABLE and self._connected:
