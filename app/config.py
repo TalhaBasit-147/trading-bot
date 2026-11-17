@@ -99,6 +99,13 @@ class Settings(BaseSettings):
     MT5_PASSWORD: str | None = None
     MT5_SERVER: str | None = None
     MT5_PATH: str | None = None
+    # Start/attach the terminal in portable mode (its data lives next to MT5_PATH).
+    # Needed for a second terminal copied into its own folder.
+    MT5_PORTABLE: bool = False
+    # Account number this bot is allowed to trade. If set, the bot refuses to start
+    # on any other account and pauses (with an alert) if the terminal switches
+    # account while running. Essential when two terminals run on one machine.
+    MT5_EXPECTED_LOGIN: int | None = None
     MT5_MAGIC: int = 20251116
 
     # DB
@@ -113,6 +120,9 @@ class Settings(BaseSettings):
     # Telegram
     TELEGRAM_BOT_TOKEN: str | None = None
     TELEGRAM_CHAT_ID: str | None = None
+    # Prefix on every Telegram message (e.g. "LIVE" / "DEMO") so alerts from two
+    # bots sharing one chat can't be confused. Empty = no prefix.
+    BOT_LABEL: str = ""
 
     # API
     API_HOST: str = "0.0.0.0"

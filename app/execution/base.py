@@ -50,6 +50,17 @@ class Broker(ABC):
         fixed-target position when this is False. Default: False (safe)."""
         return False
 
+    def wrong_account_reason(self) -> Optional[str]:
+        """None if this broker is connected to the account the bot is configured
+        for, else a reason not to trade. Default: no expectation (None)."""
+        return None
+
+    def deals_today(self, symbols: List[str]) -> List[dict]:
+        """This bot's deals since the start of the current broker day, oldest first:
+        dicts with time (broker clock, naive), symbol, position, kind ('in'|'out'),
+        comment, pnl. Used to rebuild daily state after a restart. Default: []."""
+        return []
+
     def realized_pnl(self, ticket: int) -> Optional[float]:
         """Realized net P/L for a closed position from broker history.
 
