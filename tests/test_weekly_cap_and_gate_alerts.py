@@ -61,6 +61,7 @@ def test_loss_cap_block_and_release_are_alerted_once(monkeypatch, tmp_path):
 def test_engine_bar_with_tripped_weekly_cap_alerts_and_does_not_trade(monkeypatch, tmp_path):
     from app.core.types import Bar
     eng, _ = _engine(monkeypatch, tmp_path, "XAUUSD,BTCUSD")
+    eng._sym["XAUUSD"].current_day = eng._risk_day = "2026-11-20"   # mid-day: no day roll re-reading equity
     eng.risk.state.week_start_equity = 1000.0
     eng.risk.state.equity_start_of_day = 880.0
     eng.risk.sync_equity(880.0)                      # -12% this week, 0% today
