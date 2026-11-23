@@ -38,8 +38,13 @@ class RiskState:
     open_positions: int = 0
 
 
+def _utc_now() -> datetime:
+    """Wall-clock UTC (patchable in tests)."""
+    return datetime.now(timezone.utc)
+
+
 def _today() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return _utc_now().strftime("%Y-%m-%d")
 
 
 def _iso_week(d: datetime) -> str:
@@ -56,7 +61,7 @@ class RiskManager:
             equity=starting_equity,
             week_start_equity=starting_equity,
         )
-        self._current_week = _iso_week(datetime.now(timezone.utc))
+        self._current_week = _iso_week(_utc_now())
         # Account-wide caps. None = use settings (single-symbol behaviour). The
         # multi-symbol engine passes the totals across symbols and enforces each
         # symbol's own cap itself, so one symbol's trade can't block another's.
@@ -69,10 +74,19 @@ class RiskManager:
         self.state.equity = equity
         self.state.equity_start_of_day = equity
         self.state.daily = DailyStats(day=_today())
-        week_now = _iso_week(datetime.now(timezone.utc))
+        self._roll_week()
+
+    def _roll_week(self) -> None:
+        """Start a new loss-cap week when the UTC ISO week changes. Checked on every
+        can_trade call, not only at the engine's day roll: the broker day rolls at
+        22:00 UTC on Sunday, while the UTC week is still the old one, so a week roll
+        tied to the day roll left a tripped weekly cap blocking all of Monday."""
+        week_now = _iso_week(_utc_now())
         if week_now != self._current_week:
+            logger.info(f"RiskManager: new week {week_now} (was {self._current_week}), "
+                        f"week start equity ${self.state.equity:,.2f}")
             self._current_week = week_now
-            self.state.week_start_equity = equity
+            self.state.week_start_equity = self.state.equity
 
     def update_equity(self, equity: float) -> None:
         self.state.equity = equity
@@ -105,6 +119,7 @@ class RiskManager:
         if self.state.daily.day != today:
             self.state.daily = DailyStats(day=today)
             self.state.equity_start_of_day = self.state.equity
+        self._roll_week()
 
         # daily loss cap
         daily_dd = (self.state.equity - self.state.equity_start_of_day) / max(self.state.equity_start_of_day, 1e-9)
