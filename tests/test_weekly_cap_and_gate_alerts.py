@@ -13,9 +13,12 @@ def _at(monkeypatch, dt):
 
 
 def test_tripped_weekly_cap_resets_at_monday_00_utc_without_a_day_roll(monkeypatch):
-    _at(monkeypatch, datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc))        # Friday W47
+    _at(monkeypatch, datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc))        # Tuesday W47
     rm = RiskManager(starting_equity=324.65)
-    rm.sync_equity(286.58)                                                     # -11.7% for the week
+    _at(monkeypatch, datetime(2026, 11, 20, 0, 1, tzinfo=timezone.utc))         # losses spread over the week
+    rm.on_new_day(294.64)
+    _at(monkeypatch, datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc))
+    rm.sync_equity(286.58)                                    # -2.7% today (under the daily cap), -11.7% for the week
     ok, why = rm.can_trade()
     assert not ok and "weekly loss cap" in why
     # Sunday 22:01 UTC: the broker's day roll calls on_new_day, but the UTC week is still W47
