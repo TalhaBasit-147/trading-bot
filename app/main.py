@@ -347,6 +347,29 @@ class Engine:
         logger.info(msg)
         self.notifier.send("♻️ " + msg)
 
+    # Risk-gate reasons worth a Telegram alert: they stop ALL new trades for hours
+    # or days. Routine ones (daily trade count, open-position count) only go to
+    # the log, or every normal trading day would send an alert.
+    ALERT_GATE_REASONS = ("daily loss cap", "weekly loss cap", "cool-down", "kill-switch")
+
+    def _report_risk_gate(self, ok: bool, why: str) -> None:
+        """Log every change of the account-wide risk gate; alert on Telegram when a
+        loss cap / cool-down / kill switch starts or stops blocking new trades.
+        Blocking used to be completely silent."""
+        key = None if ok else why.split(" (")[0].split(" until ")[0]
+        prev = getattr(self, "_gate_key", None)
+        if key == prev:
+            return
+        self._gate_key = key
+        if key is not None:
+            logger.warning(f"Risk gate: new trades blocked — {why}")
+            if key.startswith(self.ALERT_GATE_REASONS):
+                self.notifier.send(f"⛔ New trades blocked: {why}. Open trades are still managed.")
+        else:
+            logger.info(f"Risk gate: trading allowed again (was: {prev})")
+            if prev.startswith(self.ALERT_GATE_REASONS):
+                self.notifier.send(f"✅ Trading allowed again (was blocked: {prev})")
+
     ACCOUNT_CHECK_SECS = 5.0
 
     def _account_ok(self) -> bool:
@@ -460,7 +483,8 @@ class Engine:
 
         # ── Risk gate (account-wide) ──────────────────────────────────────
         if self.risk.state.paused: return
-        ok, _ = self.risk.can_trade(last.ts)
+        ok, why = self.risk.can_trade(last.ts)
+        self._report_risk_gate(ok, why)
         if not ok: return
 
         # ── Run live strategies independently (with daily loss gate) ───────
